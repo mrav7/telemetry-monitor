@@ -5,6 +5,13 @@
   Logs go to stdout so that the service behaves predictably when run from a
   terminal, under Docker and in CI. Appenders that write elsewhere are
   deliberately not configured.
+
+  The root level is taken from TM_LOG_LEVEL, the same variable the application
+  validates at startup. Reading it here rather than reconfiguring Logback from
+  code keeps the level correct no matter when logging is first initialised, and
+  avoids compiling application code against the SLF4J binding. Values Logback
+  would otherwise accept but the service does not, such as ALL and OFF, are
+  rejected during configuration validation, so the process never runs with them.
 -->
 <configuration>
 
@@ -14,7 +21,7 @@
     </encoder>
   </appender>
 
-  <root level="INFO">
+  <root level="${TM_LOG_LEVEL:-INFO}">
     <appender-ref ref="CONSOLE"/>
   </root>
 
