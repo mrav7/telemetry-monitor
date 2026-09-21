@@ -1,9 +1,45 @@
-# Maven build output
+# Maven / Java build output
 target/
+*.class
+
+# Local environment files
+.env
+.env.local
+.env.*
+!.env.example
 
 # IntelliJ IDEA
 .idea/
 *.iml
+*.iws
+*.ipr
+out/
 
-# VS Code
+# Visual Studio Code
 .vscode/
+
+# Eclipse
+.classpath
+.project
+.settings/
+.factorypath
+
+# Logs
+*.log
+
+# JVM crash / diagnostic files
+hs_err_pid*
+replay_pid*
+
+# Temporary / editor files
+*.tmp
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+Desktop.ini
