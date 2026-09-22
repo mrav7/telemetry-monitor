@@ -186,7 +186,7 @@ input isolation, and disconnect isolation.
 ./mvnw test
 ```
 
-To run the same lifecycle that continuous integration runs:
+To run the same lifecycle that the [CI](#ci) build-and-test job runs:
 
 ```bash
 ./mvnw verify
@@ -521,6 +521,34 @@ checks that:
 
 It stops and removes only the container it created.
 
+## CI
+
+GitHub Actions runs the `CI` workflow on every push and pull request, on an
+Ubuntu runner with Temurin Java 25 and the Maven Wrapper. It has two
+independent jobs, and both must pass:
+
+| Job | What it runs |
+|---|---|
+| Build and test | `./mvnw verify`: compiles and runs the full test suite. |
+| Container smoke | Packages the host simulator without running the tests again, builds the Docker image, and runs `scripts/container-smoke.sh` against it. |
+
+The Docker build runs the full Maven package and test lifecycle inside its
+builder stage, so the image is only produced from a tested build. The
+workflow needs no secrets and only read access to the repository, and it
+does not publish any image.
+
+The same checks can be run locally from the repository root:
+
+```bash
+# Build and test
+./mvnw --batch-mode --no-transfer-progress verify
+
+# Container smoke
+./mvnw --batch-mode --no-transfer-progress -DskipTests package
+docker build -t telemetry-monitor:local .
+scripts/container-smoke.sh telemetry-monitor:local
+```
+
 ## Current limitations
 
 - Source state is in memory only, and is not exposed anywhere but the logs:
@@ -531,8 +559,6 @@ It stops and removes only the container it created.
 - Graceful shutdown is bounded and non-durable. Work still queued or in flight
   when the global deadline expires may be discarded.
 - Protocol v1 has no client acknowledgement.
-- The container smoke test is run locally. Continuous integration builds and
-  tests the project but does not build the Docker image.
 
 ## Technology
 

@@ -4,10 +4,14 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-and-test:
     name: Build and test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
@@ -22,3 +26,30 @@ jobs:
 
       - name: Build and test
         run: ./mvnw --batch-mode --no-transfer-progress verify
+
+  container-smoke:
+    name: Container smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      # The smoke test runs the packaged simulator on the runner. The test
+      # suite already runs in the other job and again inside the image build.
+      - name: Package host simulator
+        run: ./mvnw --batch-mode --no-transfer-progress -DskipTests package
+
+      - name: Build container image
+        run: docker build --tag telemetry-monitor:ci .
+
+      - name: Run container smoke
+        run: scripts/container-smoke.sh telemetry-monitor:ci
