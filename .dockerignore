@@ -1,0 +1,12 @@
+# The build context is an allowlist: everything is excluded unless it is
+# needed to build the image from source. New repository files stay out of the
+# context until they are deliberately added here.
+**
+
+!Dockerfile
+!pom.xml
+!mvnw
+!.mvn/
+!.mvn/**
+!src/
+!src/**

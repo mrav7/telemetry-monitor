@@ -17,7 +17,8 @@ producer/consumer pipeline with explicitly limited resources.
 > traffic modes. Automated simulator-to-monitor tests cover ONLINE, STALE,
 > recovery, multiple clients, bounded backpressure, malformed input isolation
 > and disconnect isolation. The packaged monitor and simulator can be run as
-> separate JVM processes over TCP.
+> separate JVM processes over TCP, and the monitor can be built and run as a
+> Docker container.
 
 ## Requirements
 
@@ -400,6 +401,126 @@ Operational shutdown progress is logged with events such as
 `shutdown_drain_completed`, and `shutdown_completed`. A deadline expiry or
 forced stop is logged at `WARN` with queue and in-flight context where useful.
 
+## Docker
+
+The repository's `Dockerfile` builds the monitor from source in two stages. The
+first stage compiles, tests and packages the project with the Maven Wrapper on
+a Java 25 JDK. The final image is an Eclipse Temurin Java 25 JRE image (Ubuntu
+based) with only the application JAR and its runtime dependencies added. It
+contains no build tools, sources or tests, and runs the monitor as an
+unprivileged user.
+
+Build the image from the repository root:
+
+```bash
+docker build -t telemetry-monitor:local .
+```
+
+The build runs the full test suite and fails if any test fails.
+
+Run the monitor with its port published on the host's loopback interface:
+
+```bash
+docker run --rm \
+  --name telemetry-monitor \
+  -e TM_BIND_ADDRESS=0.0.0.0 \
+  -p 127.0.0.1:9100:9100 \
+  telemetry-monitor:local
+```
+
+`TM_BIND_ADDRESS=0.0.0.0` is required here. The service's default,
+`127.0.0.1`, is the container's own loopback interface, and traffic arriving
+through a published port never reaches it. The image does not change that
+default: listening more widely is an explicit choice made when the container is
+started. `-p 127.0.0.1:9100:9100` then publishes the port on the host's
+loopback interface only. The image declares `EXPOSE 9100` to document the
+default port, but that does not publish anything by itself.
+
+The container is configured with the same `TM_*` environment variables as a
+host run (see [Configuration](#configuration)); there are no Docker-specific
+settings. If `TM_PORT` is changed, publish that container port instead.
+
+```bash
+docker run --rm \
+  --name telemetry-monitor \
+  -e TM_BIND_ADDRESS=0.0.0.0 \
+  -e TM_MAX_CONNECTIONS=64 \
+  -e TM_LOG_LEVEL=DEBUG \
+  -p 127.0.0.1:9100:9100 \
+  telemetry-monitor:local
+```
+
+Logs go to standard output and no log file is written inside the container.
+Read them with:
+
+```bash
+docker logs telemetry-monitor
+```
+
+The image defines no `HEALTHCHECK`, and the service has no HTTP endpoint.
+Readiness shows up in the logs as `event=server_listening`.
+
+### Simulator against the container
+
+The packaged simulator on the host reaches the container through the published
+port:
+
+```bash
+./mvnw package
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --host 127.0.0.1 --port 9100 \
+  --source-id docker-source --mode disconnect --count 3
+```
+
+`docker logs telemetry-monitor` then shows
+`event=source_first_seen source_id=docker-source`. As in a host run, the
+simulator's exit status only reports whether its own scenario completed; the
+monitor does not acknowledge telemetry.
+
+### Stopping the container
+
+```bash
+docker stop --timeout 15 telemetry-monitor
+```
+
+`docker stop` sends `SIGTERM`. The image starts Java directly, with no shell in
+between, so the JVM is the container's main process. The signal reaches it and
+runs the same [graceful shutdown](#graceful-shutdown) as on a host, logged as
+`shutdown_requested` … `shutdown_completed`. After that the container exits
+with status 143, meaning it was ended by `SIGTERM`.
+
+`docker stop` waits 10 seconds by default before sending `SIGKILL`, which is
+the same as the default `TM_SHUTDOWN_GRACE_SECONDS`. A stop timeout longer than
+the configured grace, as above, lets a shutdown that uses its whole budget
+finish first. A container that is killed (exit status 137) skips whatever
+shutdown steps remain.
+
+### Container smoke test
+
+`scripts/container-smoke.sh` checks a built image end to end. It needs the
+host package, for the simulator, and Java 25 on the host (`JAVA_HOME` or
+`PATH`):
+
+```bash
+./mvnw package
+docker build -t telemetry-monitor:local .
+scripts/container-smoke.sh telemetry-monitor:local
+```
+
+The script starts a container with explicit `TM_*` settings on a free
+loopback host port and waits for `server_listening`, with a time limit. It then
+checks that:
+
+- the configured values reached the application;
+- Java is the container's PID 1;
+- the simulator can send telemetry that the monitor admits;
+- `docker stop` completes the graceful shutdown without a `SIGKILL`;
+- the host port is released;
+- an invalid `TM_PORT` stops startup with a diagnostic.
+
+It stops and removes only the container it created.
+
 ## Current limitations
 
 - Source state is in memory only, and is not exposed anywhere but the logs:
@@ -409,7 +530,9 @@ forced stop is logged at `WARN` with queue and in-flight context where useful.
   identifiers holds the ones it admitted until it stops.
 - Graceful shutdown is bounded and non-durable. Work still queued or in flight
   when the global deadline expires may be discarded.
-- There is no container image yet, and protocol v1 has no client acknowledgement.
+- Protocol v1 has no client acknowledgement.
+- The container smoke test is run locally. Continuous integration builds and
+  tests the project but does not build the Docker image.
 
 ## Technology
 
@@ -420,3 +543,4 @@ forced stop is logged at `WARN` with queue and in-flight context where useful.
 | JSON | Jackson |
 | Logging | SLF4J with Logback, to stdout |
 | Testing | JUnit 6.1.3, Awaitility |
+| Container | Docker, Eclipse Temurin 25 base images |
