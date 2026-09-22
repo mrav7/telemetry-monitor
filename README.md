@@ -1,29 +1,22 @@
 # Telemetry Monitor
 
-Core Java service for concurrent TCP telemetry ingestion, source monitoring and
+Telemetry Monitor is a personal technical Java project for generic TCP
+telemetry ingestion, concurrent processing, source-state monitoring and
 graceful shutdown.
 
-The service is being built as a long-running process that accepts telemetry from
-multiple TCP clients, validates it, and processes it through a bounded
-producer/consumer pipeline with explicitly limited resources.
-
-> **Project status:** The build baseline, the operational
-> configuration, the protocol layer, the ingestion pipeline — a concurrent TCP
-> listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing, message
-> validation, a bounded queue and a fixed set of processing workers — and
-> source monitoring, which tracks every source as `ONLINE` or `STALE`, and
-> coordinated graceful shutdown are implemented and tested. A TCP telemetry
-> simulator core now provides normal, burst, malformed, silent and disconnect
-> traffic modes. Automated simulator-to-monitor tests cover ONLINE, STALE,
-> recovery, multiple clients, bounded backpressure, malformed input isolation
-> and disconnect isolation. The packaged monitor and simulator can be run as
-> separate JVM processes over TCP, and the monitor can be built and run as a
-> Docker container.
+It is a long-running Core Java service that accepts newline-delimited JSON
+telemetry from many TCP clients, validates each message, and processes it
+through a bounded producer/consumer pipeline. Every resource that external
+input can grow — connections, message size, queued events, known sources — has
+an explicit limit. A companion simulator generates normal, burst, malformed,
+silent and disconnecting traffic, and the monitor runs from the terminal on
+Linux or as a Docker container.
 
 ## Requirements
 
 - **Java 25** (the build targets release 25)
 - No Maven installation — the repository ships the Maven Wrapper
+- Docker, only to build and run the container image
 
 Maven itself is downloaded and pinned by the wrapper on first use, so local and
 CI builds resolve the same Maven version.
@@ -158,27 +151,47 @@ java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
   --source-id disconnect-01 --mode disconnect --count 3
 ```
 
-## End-to-end flow
+## Architecture overview
 
 ```text
-Telemetry Simulator
-        ↓ TCP
-Telemetry Server
-        ↓
-framing / UTF-8 / JSON validation
-        ↓
-bounded queue
-        ↓
-fixed workers
-        ↓
-Source Registry
-        ↑
-scheduled stale detection
+Telemetry Simulator (or any TCP client)
+        │  TCP, one NDJSON message per line
+        ▼
+TelemetryServer ── accept loop, connection limit
+        │  one virtual thread per connection
+        ▼
+byte framing → strict UTF-8 → JSON decoding → validation
+        │  blocking put
+        ▼
+bounded queue (ArrayBlockingQueue)
+        │
+        ▼
+fixed processing workers
+        │
+        ▼
+SourceRegistry ◄── StaleMonitor (scheduled ONLINE → STALE check)
+
+ShutdownCoordinator ── one global deadline for the whole stop sequence
 ```
 
-Automated end-to-end verification covers `ONLINE`, `STALE` while a connection
-remains active, recovery, multiple simulators, bounded backpressure, malformed
-input isolation, and disconnect isolation.
+- **`TelemetryServer`** owns the listening socket, the connection sockets and
+  the virtual-thread executor. Connection tasks only read, frame, decode,
+  validate and enqueue.
+- **`ProcessingPipeline`** owns the bounded queue and the fixed worker pool.
+- **`SourceRegistry`** is the only place source state changes; workers apply
+  accepted events to it with atomic per-source updates.
+- **`StaleMonitor`** runs the periodic staleness check on a scheduled executor.
+- **`ShutdownCoordinator`** stops these components in a fixed order under one
+  deadline, from either `SIGTERM` or normal JVM shutdown.
+
+Configuration is read once at startup from environment variables. Logs go to
+standard output; an invalid configuration is reported on standard error before
+logging starts.
+
+Automated end-to-end tests run the simulator against the monitor over real
+TCP and cover `ONLINE`, `STALE` while a connection remains open, recovery,
+multiple simulators, bounded backpressure, malformed-input isolation and
+disconnect isolation.
 
 ## Test
 
@@ -303,7 +316,11 @@ The worker count does not grow with load.
 
 **Backpressure.** When the queue is full, the connection being read waits for
 capacity instead of discarding the message. That connection stops consuming its
-socket, and TCP then slows the sender down. Valid messages are not dropped.
+socket, and TCP then slows the sender down. A full queue therefore never causes
+a validated message to be discarded at the enqueue step. This is flow control,
+not durability: accepted events live only in memory and can still be lost if
+the process ends abruptly or a shutdown deadline expires (see
+[Known limitations and security baseline](#known-limitations-and-security-baseline)).
 
 **Source state.** Workers are what apply an accepted message to the state of its
 source; connections never touch it. That keeps the decision of what a source's
@@ -401,6 +418,29 @@ Operational shutdown progress is logged with events such as
 `shutdown_drain_completed`, and `shutdown_completed`. A deadline expiry or
 forced stop is logged at `WARN` with queue and in-flight context where useful.
 
+## Failure behavior
+
+| Situation | What happens | Where to look |
+|---|---|---|
+| Invalid configuration | Startup stops before anything is opened; exit status `1`. | `Invalid configuration: ...` on standard error, naming the variable |
+| Port already in use, or bind fails | Startup stops; exit status `2`. | `event=server_start_failed` with the address, port and reason |
+| Malformed JSON, missing, unknown or repeated property, wrong type, unsupported version, invalid field value | That message is discarded; the connection stays open. | `event=message_rejected reason=...` (for example `invalid_json`, `unsupported_version`, `invalid_source_id`) |
+| Empty line | Discarded; the connection stays open. | `event=message_rejected reason=empty_frame` |
+| Invalid UTF-8 | That message is discarded; the connection stays open. | `event=message_rejected reason=invalid_utf8` |
+| Message larger than `TM_MAX_MESSAGE_BYTES` | Not processed; that connection is closed. | `event=oversized_message reason=message_too_large` |
+| `TM_MAX_CONNECTIONS` reached | The new connection is closed immediately; existing ones continue. | `event=connection_rejected reason=max_connections` |
+| `TM_MAX_SOURCES` reached | Messages from unknown sources are refused; known sources continue. | `event=source_rejected reason=max_sources` |
+| Client disconnects or its connection fails | Only that connection ends. An unterminated trailing message is discarded. | `event=connection_io_failure` at `WARN`; normal closes at `DEBUG` |
+| Unexpected exception while applying an event | Logged and isolated to that event; the worker continues. | `event=processing_failure` at `ERROR` |
+| Queue full | The sending connection waits (backpressure); nothing is discarded at that point. | Slower upstream sending; no per-message log |
+| Source falls silent | Marked `STALE` by the next check; its connection is left open. | `event=source_stale` |
+| Stale source sends again | Returns to `ONLINE`. | `event=source_online` |
+| Shutdown deadline expires | Remaining work may be discarded; shutdown still completes. | `event=shutdown_deadline_expired` or `event=shutdown_forced` at `WARN` |
+
+Rejected messages are logged with a reason, never with their payload. The
+monitor does not retry, reconnect or answer clients; the simulator does not
+reconnect either.
+
 ## Docker
 
 The repository's `Dockerfile` builds the monitor from source in two stages. The
@@ -432,8 +472,11 @@ docker run --rm \
 `127.0.0.1`, is the container's own loopback interface, and traffic arriving
 through a published port never reaches it. The image does not change that
 default: listening more widely is an explicit choice made when the container is
-started. `-p 127.0.0.1:9100:9100` then publishes the port on the host's
-loopback interface only. The image declares `EXPOSE 9100` to document the
+started. It is what makes the published port work, not a security boundary:
+access is limited by where the port is published. `-p 127.0.0.1:9100:9100`
+publishes it on the host's loopback interface only. Do not publish the port on
+an interface reachable from untrusted networks (see
+[Known limitations and security baseline](#known-limitations-and-security-baseline)). The image declares `EXPOSE 9100` to document the
 default port, but that does not publish anything by itself.
 
 The container is configured with the same `TM_*` environment variables as a
@@ -549,24 +592,88 @@ docker build -t telemetry-monitor:local .
 scripts/container-smoke.sh telemetry-monitor:local
 ```
 
-## Current limitations
+## Known limitations and security baseline
 
-- Source state is in memory only, and is not exposed anywhere but the logs:
-  there is no API, no endpoint and no export. Individual telemetry values are
-  counted, not stored — no history is kept.
-- Sources are never removed, so a process that is sent many distinct source
-  identifiers holds the ones it admitted until it stops.
-- Graceful shutdown is bounded and non-durable. Work still queued or in flight
-  when the global deadline expires may be discarded.
-- Protocol v1 has no client acknowledgement.
+Telemetry Monitor is intended for development, testing and controlled
+environments. It is not hardened for exposure to the Internet or other
+untrusted networks.
+
+**Security.** There is no TLS, no authentication, no authorization, no client
+certificates, no per-identity rate limiting and no payload encryption. Any
+client that can reach the port can send telemetry for any `sourceId`. The
+resource limits protect the process from unbounded growth; they are not access
+control.
+
+**State and delivery.**
+
+- All state is in memory and lasts only as long as the process. Restarting the
+  monitor loses known sources, counters, statuses and any telemetry not yet
+  processed.
+- There is no database and no telemetry history: individual values are counted,
+  not stored.
+- Source state is visible only in the logs. There is no API, endpoint or export.
+- There are no delivery guarantees: no acknowledgement, no at-least-once or
+  exactly-once processing, no persistent retry. An accepted event can be lost if
+  the process ends abruptly, and graceful shutdown can discard queued or
+  in-flight work when its deadline expires.
+- Sources are never evicted. Once `TM_MAX_SOURCES` distinct sources are known,
+  new ones are refused until the process restarts.
+
+**Ordering and duplicates.** TCP keeps bytes in order within one connection,
+but there is no global processing order across connections, sources or
+workers. Two events from the same source can finish processing in a different
+order from how they arrived; source state is designed to stay correct when
+that happens. There is no deduplication: two identical valid messages are two
+events.
+
+**Capacity.** The configured limits are resource controls, not throughput or
+latency promises. No performance figures are published.
+
+## Troubleshooting
+
+```bash
+# Is the monitor running, and with which PID?
+ps -ef | grep '[T]elemetryMonitorApplication'
+
+# Is it listening?
+ss -ltn 'sport = :9100'
+
+# Which process holds the port?
+lsof -nP -iTCP:9100 -sTCP:LISTEN
+
+# Follow logs that were redirected to a file
+tail -f monitor.log
+
+# JVM command line and a thread dump
+jcmd <pid> VM.command_line
+jstack <pid>
+
+# Container state and logs
+docker ps
+docker logs <container>
+```
+
+- **Startup fails:** read the `Invalid configuration: ...` line, or the
+  `event=server_start_failed` record, which names the address and port.
+- **Address already in use:** find the owner with `ss -ltnp` or `lsof`, then
+  stop it or choose another `TM_PORT`.
+- **The simulator cannot connect:** check that `--host` and `--port` match
+  `TM_BIND_ADDRESS` and `TM_PORT`; the monitor listens on `127.0.0.1` by
+  default.
+- **A container does not receive host traffic:** check that the container was
+  started with `TM_BIND_ADDRESS=0.0.0.0` and that `docker port <container>`
+  shows the published port.
+- **Shutdown takes long or reports expiry:** follow the `shutdown_*` events;
+  `WARN` records name the phase that ran out of time.
 
 ## Technology
 
 | Concern | Choice |
 |---|---|
 | Language / runtime | Java 25 |
-| Build | Maven (via Maven Wrapper) |
+| Build | Maven 3.9.16 via Maven Wrapper |
 | JSON | Jackson |
 | Logging | SLF4J with Logback, to stdout |
 | Testing | JUnit 6.1.3, Awaitility |
 | Container | Docker, Eclipse Temurin 25 base images |
+| CI | GitHub Actions |
