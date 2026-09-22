@@ -21,8 +21,9 @@ import org.slf4j.LoggerFactory;
  * blocks instead of discarding: the connection thread stops reading its socket, and TCP then slows
  * the remote sender. No valid event is dropped during normal operation.
  *
- * <p>Workers hand each envelope to a {@link Consumer} boundary. That boundary is where source state
- * will later be applied; this class deliberately holds no state of its own beyond the queue.
+ * <p>Workers hand each envelope to a {@link Consumer} boundary, which the service wires to the
+ * source registry. This class deliberately holds no state of its own beyond the queue, so what an
+ * event does to source state is decided in one place and not here.
  *
  * <p>The pipeline owns its queue and its worker executor, and closes both in {@link #close()}.
  */

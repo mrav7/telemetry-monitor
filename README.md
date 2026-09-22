@@ -8,12 +8,11 @@ multiple TCP clients, validates it, and processes it through a bounded
 producer/consumer pipeline with explicitly limited resources.
 
 > **Project status:** early development. The build baseline, the operational
-> configuration, the protocol layer and the ingestion pipeline — a concurrent
-> TCP listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing,
-> message validation, a bounded queue and a fixed set of processing workers —
-> are implemented and tested. Accepted messages currently reach a minimal
-> processing boundary that logs them at `DEBUG` level and nothing more. Source
-> monitoring (`ONLINE`/`STALE`) and graceful shutdown are not implemented yet.
+> configuration, the protocol layer, the ingestion pipeline — a concurrent TCP
+> listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing, message
+> validation, a bounded queue and a fixed set of processing workers — and
+> source monitoring, which tracks every source as `ONLINE` or `STALE`, are
+> implemented and tested. Graceful shutdown is not implemented yet.
 
 ## Requirements
 
@@ -66,15 +65,20 @@ carry several sources. An invalid message is rejected on its own and the
 connection stays usable; an oversized message ends the connection that sent it,
 because the byte stream can no longer be realigned to a message boundary.
 
-With `TM_LOG_LEVEL=DEBUG` the monitor reports each connection and each processed
-message:
+Source state changes are reported at `INFO`; with `TM_LOG_LEVEL=DEBUG` each
+connection is reported as well:
 
 ```text
 event=server_listening bind_address=127.0.0.1 port=9100 max_connections=256
 event=connection_accepted connection_id=1 remote=/127.0.0.1:37786
-event=event_processed source_id=source-01 metric=temperature ...
+event=source_first_seen source_id=source-01 first_accepted_at=... known_sources=1
+event=source_stale source_id=source-01 last_accepted_at=... silent_seconds=30
+event=source_online source_id=source-01 last_accepted_at=...
 event=message_rejected connection_id=1 remote=/127.0.0.1:37786 reason=invalid_json
 ```
+
+Individual accepted messages are not logged: under load that would produce one
+record per message and drown everything else.
 
 To check that the listener is open:
 
@@ -117,10 +121,8 @@ its default, but a variable that is set to an unusable value stops startup with
 a diagnostic naming the variable and a non-zero exit status. Values are never
 clamped, trimmed or silently replaced by the default.
 
-`TM_MAX_SOURCES`, `TM_STALE_AFTER_SECONDS`, `TM_STALE_CHECK_INTERVAL_SECONDS`
-and `TM_SHUTDOWN_GRACE_SECONDS` describe components that are not implemented
-yet; they are validated now so that configuration stays a single, stable
-contract.
+`TM_SHUTDOWN_GRACE_SECONDS` describes a component that is not implemented yet;
+it is validated now so that configuration stays a single, stable contract.
 
 ## Protocol
 
@@ -153,8 +155,8 @@ values of the wrong JSON type are all rejected, and no value is coerced — `"1"
 is not accepted for `version`.
 
 The monitor records its own reception timestamp for each accepted message. That
-timestamp, not `occurredAt`, is what source monitoring will be based on, because
-the clock of a remote process is not a reliable liveness signal.
+timestamp, not `occurredAt`, is what source monitoring is based on, because the
+clock of a remote process is not a reliable liveness signal.
 
 ### Message size
 
@@ -192,6 +194,8 @@ framing → UTF-8 → JSON → validation
 bounded queue (TM_QUEUE_CAPACITY)
       ↓
 fixed processing workers (TM_WORKER_THREADS)
+      ↓
+source state (TM_MAX_SOURCES)  ←  scheduled staleness check
 ```
 
 **Connections.** Every accepted connection is handled on its own virtual thread,
@@ -210,16 +214,77 @@ The worker count does not grow with load.
 capacity instead of discarding the message. That connection stops consuming its
 socket, and TCP then slows the sender down. Valid messages are not dropped.
 
+**Source state.** Workers are what apply an accepted message to the state of its
+source; connections never touch it. That keeps the decision of what a source's
+state is in one place, whatever order the workers happen to run in.
+
 **Failure isolation.** An invalid message affects only that message. A
 disconnect, a connection error, an oversized message or a refused connection
 affects only the connection it belongs to; the listener and the workers keep
-running.
+running. A message from a source that cannot be admitted is refused on its own
+and costs neither the worker nor the connection.
+
+## Source state
+
+The monitor keeps the current operational state of every source it has accepted
+a message from, in memory, keyed by `sourceId`. A source is in one of two
+states:
+
+| State | Meaning |
+|---|---|
+| `ONLINE` | A known source that has not been marked `STALE`. Accepted telemetry creates this state and restores it. |
+| `STALE` | A scheduled check found that nothing had been accepted from this source for at least `TM_STALE_AFTER_SECONDS`. |
+
+There is no third state. A source the monitor has never accepted a message from
+is simply not tracked.
+
+**How state moves.** The first accepted message admits the source as `ONLINE`.
+Every further accepted message keeps it `ONLINE` and, if it was `STALE`, brings
+it back. In the other direction, a check runs every
+`TM_STALE_CHECK_INTERVAL_SECONDS` and marks as `STALE` every source whose last
+accepted message is at least `TM_STALE_AFTER_SECONDS` old. Only accepted
+telemetry makes a source `ONLINE`, and only that scheduled check makes one
+`STALE`.
+
+The state is stored, not recalculated on demand. Between the moment a source
+falls silent past the threshold and the next scheduled check, it is still
+recorded as `ONLINE`, so the check interval is also the granularity with which
+a source is observed to go `STALE`.
+
+**Which clock decides.** Freshness is measured with the monitor's own reception
+time, never with the `occurredAt` the message declares. A source whose clock is
+wrong, or which backdates its messages, is judged on when its telemetry actually
+arrived. Messages that are processed out of order cannot make a source look
+older than it is: the newest reception time always wins.
+
+**Per source, the monitor tracks:** its identifier and state, when it was first
+accepted, when it was last accepted, how many of its events were accepted, and
+how many were processed.
+
+**Connection state is not source state.** A connection that is open but silent
+does not keep its source `ONLINE`, and a source going `STALE` never closes a
+connection — both situations are normal and can be observed at the same time.
+One connection may carry several sources, and a source may arrive over several
+connections; nothing binds one to the other. Disconnecting does not remove a
+source or change its counters.
+
+**Bound.** At most `TM_MAX_SOURCES` distinct sources are tracked. Once that
+limit is reached, messages from sources already known keep being accepted as
+usual, while a message from an unknown source is refused with a log record and
+changes nothing. Nothing is evicted to make room — not even a `STALE` source,
+which keeps its slot — and the refusal affects neither the connection that sent
+it nor any other source.
+
+**Not durable.** Source state lives in memory for the lifetime of the process.
+It is not persisted, and restarting the monitor starts from no known sources.
 
 ## Current limitations
 
-- Source state is not implemented: nothing tracks which sources are `ONLINE` or
-  `STALE`. Accepted messages reach a minimal processing boundary that logs them
-  at `DEBUG` level; they are not stored, counted or aggregated anywhere.
+- Source state is in memory only, and is not exposed anywhere but the logs:
+  there is no API, no endpoint and no export. Individual telemetry values are
+  counted, not stored — no history is kept.
+- Sources are never removed, so a process that is sent many distinct source
+  identifiers holds the ones it admitted until it stops.
 - Shutdown is not graceful yet. The process stops when it is terminated; there
   is no deadline, no queue drain and no guarantee about messages already
   accepted. `TM_SHUTDOWN_GRACE_SECONDS` is validated but not yet applied.

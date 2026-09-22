@@ -5,7 +5,8 @@ import io.github.mrav7.telemetrymonitor.configuration.ConfigurationLoader;
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
 import io.github.mrav7.telemetrymonitor.network.TelemetryServer;
 import io.github.mrav7.telemetrymonitor.processing.ProcessingPipeline;
-import io.github.mrav7.telemetrymonitor.protocol.TelemetryEnvelope;
+import io.github.mrav7.telemetrymonitor.state.SourceRegistry;
+import io.github.mrav7.telemetrymonitor.state.StaleMonitor;
 import java.io.IOException;
 import java.time.Clock;
 import java.util.Map;
@@ -15,10 +16,13 @@ import org.slf4j.LoggerFactory;
 /**
  * Entry point of the Telemetry Monitor service.
  *
- * <p>Startup validates configuration, opens the listener, starts the processing workers and then
- * serves connections until the listener is closed. Accepted telemetry currently reaches a minimal
- * processing boundary that records the event; the operational source state it will feed is later
- * work.
+ * <p>Startup validates configuration, opens the listener, starts the processing workers and the
+ * scheduled staleness monitor, and then serves connections until the listener is closed. Accepted
+ * telemetry is applied to the source registry by the processing workers.
+ *
+ * <p>The runtime owns the pieces it wires together and releases them in reverse order. That is
+ * resource termination, not a shutdown policy: the service-wide deadline, the producer stop and the
+ * final queue drain are later work.
  */
 public final class TelemetryMonitorApplication {
 
@@ -63,10 +67,11 @@ public final class TelemetryMonitorApplication {
                 System.getProperty("java.vendor"));
         log.info("event=configuration {}", configuration.describe());
 
-        ProcessingPipeline pipeline =
-                new ProcessingPipeline(configuration, TelemetryMonitorApplication::process);
-        try (TelemetryServer server =
-                new TelemetryServer(configuration, Clock.systemUTC(), pipeline)) {
+        Clock clock = Clock.systemUTC();
+        SourceRegistry registry = new SourceRegistry(configuration.maxSources());
+        ProcessingPipeline pipeline = new ProcessingPipeline(configuration, registry::apply);
+        try (StaleMonitor staleMonitor = new StaleMonitor(configuration, clock, registry);
+                TelemetryServer server = new TelemetryServer(configuration, clock, pipeline)) {
             try {
                 server.bind();
             } catch (IOException e) {
@@ -78,26 +83,11 @@ public final class TelemetryMonitorApplication {
                 return EXIT_LISTENER_UNAVAILABLE;
             }
             pipeline.start();
+            staleMonitor.start();
             server.serve();
         } finally {
             pipeline.close();
         }
         return EXIT_SUCCESS;
-    }
-
-    /**
-     * Minimal processing boundary.
-     *
-     * <p>Every accepted event passes through here on a worker thread. Applying events to source
-     * state belongs to later work, so this only records that processing happened, at a level that
-     * stays quiet under normal load.
-     */
-    private static void process(TelemetryEnvelope envelope) {
-        log.debug(
-                "event=event_processed source_id={} metric={} received_at={} {}",
-                envelope.event().sourceId(),
-                envelope.event().metric(),
-                envelope.receivedAt(),
-                envelope.connection());
     }
 }
