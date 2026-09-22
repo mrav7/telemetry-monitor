@@ -241,7 +241,7 @@ class TelemetryServerTest {
     }
 
     @Test
-    @DisplayName("several frames on one connection arrive in order")
+    @DisplayName("several frames on one connection all reach processing")
     void multipleFramesOnOneConnection() throws Exception {
         int port = startServer();
         Socket client = connect(port);
@@ -250,9 +250,21 @@ class TelemetryServerTest {
         send(client, frameFor("source-01", "second", 2.0));
         send(client, frameFor("source-01", "third", 3.0));
 
-        assertEquals("first", nextProcessed().event().metric());
-        assertEquals("second", nextProcessed().event().metric());
-        assertEquals("third", nextProcessed().event().metric());
+        // What the service promises is that every valid frame reaches processing exactly once, not
+        // the order in which the workers finish with them: the queue is drained by several workers
+        // at once, so completion order is theirs to decide. Comparing sorted values rather than a
+        // set keeps a duplicate delivery a failure, and the absence probe keeps an extra one a
+        // failure too.
+        List<String> metrics =
+                new ArrayList<>(
+                        List.of(
+                                nextProcessed().event().metric(),
+                                nextProcessed().event().metric(),
+                                nextProcessed().event().metric()));
+        metrics.sort(String::compareTo);
+
+        assertEquals(List.of("first", "second", "third"), metrics);
+        assertNothingProcessed();
     }
 
     @Test
@@ -264,8 +276,17 @@ class TelemetryServerTest {
         send(client, frameFor("source-01", "temperature", 1.0));
         send(client, frameFor("source-02", "temperature", 2.0));
 
-        assertEquals("source-01", nextProcessed().event().sourceId());
-        assertEquals("source-02", nextProcessed().event().sourceId());
+        // The point is that one connection is not bound to one source identity. Which of the two
+        // the workers finish first is not part of that, so the values are compared sorted.
+        List<String> sourceIds =
+                new ArrayList<>(
+                        List.of(
+                                nextProcessed().event().sourceId(),
+                                nextProcessed().event().sourceId()));
+        sourceIds.sort(String::compareTo);
+
+        assertEquals(List.of("source-01", "source-02"), sourceIds);
+        assertNothingProcessed();
     }
 
     @Test
