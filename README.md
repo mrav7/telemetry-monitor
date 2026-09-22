@@ -178,8 +178,8 @@ ShutdownCoordinator ── one global deadline for the whole stop sequence
   the virtual-thread executor. Connection tasks only read, frame, decode,
   validate and enqueue.
 - **`ProcessingPipeline`** owns the bounded queue and the fixed worker pool.
-- **`SourceRegistry`** is the only place source state changes; workers apply
-  accepted events to it with atomic per-source updates.
+- **`SourceRegistry`** is the only place source state changes; workers hand
+  validated, queued events to it for source admission and atomic per-source updateds.
 - **`StaleMonitor`** runs the periodic staleness check on a scheduled executor.
 - **`ShutdownCoordinator`** stops these components in a fixed order under one
   deadline, from either `SIGTERM` or normal JVM shutdown.
