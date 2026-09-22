@@ -7,7 +7,7 @@ The service is being built as a long-running process that accepts telemetry from
 multiple TCP clients, validates it, and processes it through a bounded
 producer/consumer pipeline with explicitly limited resources.
 
-> **Project status:** early development. The build baseline, the operational
+> **Project status:** The build baseline, the operational
 > configuration, the protocol layer, the ingestion pipeline — a concurrent TCP
 > listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing, message
 > validation, a bounded queue and a fixed set of processing workers — and
@@ -16,7 +16,8 @@ producer/consumer pipeline with explicitly limited resources.
 > simulator core now provides normal, burst, malformed, silent and disconnect
 > traffic modes. Automated simulator-to-monitor tests cover ONLINE, STALE,
 > recovery, multiple clients, bounded backpressure, malformed input isolation
-> and disconnect isolation. Final simulator run documentation is still pending.
+> and disconnect isolation. The packaged monitor and simulator can be run as
+> separate JVM processes over TCP.
 
 ## Requirements
 
@@ -32,15 +33,16 @@ CI builds resolve the same Maven version.
 ./mvnw package
 ```
 
-## Run
+This produces `target/telemetry-monitor-0.1.0-SNAPSHOT.jar` and copies its
+runtime dependencies to `target/lib/`. No separate Maven classpath-generation
+step is needed to run either application.
 
-Build once, then write out the runtime classpath and start the service:
+## Run the monitor
+
+Start the service from the packaged build:
 
 ```bash
-./mvnw package
-./mvnw -q dependency:build-classpath \
-  -Dmdep.outputFile=target/classpath.txt -DincludeScope=runtime
-java -cp "target/classes:$(cat target/classpath.txt)" \
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
   io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
 ```
 
@@ -49,7 +51,7 @@ address and port, and then serves until the process is terminated:
 
 ```bash
 TM_BIND_ADDRESS=127.0.0.1 TM_PORT=9100 TM_LOG_LEVEL=DEBUG \
-  java -cp "target/classes:$(cat target/classpath.txt)" \
+  java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
   io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
 ```
 
@@ -89,6 +91,93 @@ To check that the listener is open:
 ```bash
 ss -ltn 'sport = :9100'
 ```
+
+## Run the simulator
+
+The simulator is the second application in the packaged build. It connects to
+the monitor over TCP and requires `--source-id` and `--mode`:
+
+```bash
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id source-01 --mode disconnect
+```
+
+Common defaults are `--host 127.0.0.1`, `--port 9100`, `--metric temperature`,
+and `--value 20.0`. `normal` defaults to one event per second for 30 seconds;
+`burst` defaults to 1000 events; `silent` defaults to 40 seconds; and
+`disconnect` defaults to three events. A simulator exits with `0` when its
+configured client-side scenario completes successfully, `1` for invalid CLI
+configuration, and `2` when it cannot execute the scenario. Success does not
+mean the monitor acknowledged, accepted, or processed an event: protocol v1
+has no acknowledgement or persistence.
+
+### Simulator modes
+
+| Mode | Purpose | Relevant controls |
+|---|---|---|
+| `normal` | Periodic valid telemetry | `--rate`, `--duration-seconds` |
+| `burst` | Valid events without deliberate pacing | `--count` |
+| `malformed` | One deliberately invalid frame | `--case` |
+| `silent` | One valid event, then an open silent TCP connection | `--duration-seconds` |
+| `disconnect` | Valid events, then a normal close | `--count` |
+
+Malformed cases are `broken-json`, `missing-field`, `unsupported-version`,
+`invalid-source-id`, `invalid-timestamp`, and `invalid-value`.
+
+### Simulator examples
+
+Run these after `./mvnw package` while a monitor is listening on
+`127.0.0.1:9100`:
+
+```bash
+# Periodic valid telemetry.
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id normal-01 --mode normal --rate 5 --duration-seconds 2
+
+# A valid burst without deliberate pacing.
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id burst-01 --mode burst --count 100
+
+# One deliberately invalid frame.
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id malformed-01 --mode malformed --case invalid-value
+
+# Establish a source, then keep its connection open without telemetry.
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id silent-01 --mode silent --duration-seconds 40
+
+# Send valid telemetry and close normally.
+java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
+  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
+  --source-id disconnect-01 --mode disconnect --count 3
+```
+
+## End-to-end flow
+
+```text
+Telemetry Simulator
+        ↓ TCP
+Telemetry Server
+        ↓
+framing / UTF-8 / JSON validation
+        ↓
+bounded queue
+        ↓
+fixed workers
+        ↓
+Source Registry
+        ↑
+scheduled stale detection
+```
+
+Automated end-to-end verification covers `ONLINE`, `STALE` while a connection
+remains active, recovery, multiple simulators, bounded backpressure, malformed
+input isolation, and disconnect isolation.
 
 ## Test
 
@@ -320,8 +409,7 @@ forced stop is logged at `WARN` with queue and in-flight context where useful.
   identifiers holds the ones it admitted until it stops.
 - Graceful shutdown is bounded and non-durable. Work still queued or in flight
   when the global deadline expires may be discarded.
-- Final simulator run documentation is not yet complete. There is no container
-  image and no acknowledgement to clients.
+- There is no container image yet, and protocol v1 has no client acknowledgement.
 
 ## Technology
 
@@ -331,4 +419,4 @@ forced stop is logged at `WARN` with queue and in-flight context where useful.
 | Build | Maven (via Maven Wrapper) |
 | JSON | Jackson |
 | Logging | SLF4J with Logback, to stdout |
-| Testing | JUnit 5, Awaitility |
+| Testing | JUnit 6.1.3, Awaitility |
