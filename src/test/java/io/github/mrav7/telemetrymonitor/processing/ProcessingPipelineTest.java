@@ -9,9 +9,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationException;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationLoader;
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import io.github.mrav7.telemetrymonitor.protocol.ConnectionContext;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEnvelope;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEvent;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -206,6 +208,121 @@ class ProcessingPipelineTest {
                 "after-failure",
                 processed.poll(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS),
                 "the only worker must survive a failing event and keep consuming");
+    }
+
+    @Test
+    @DisplayName("an empty pipeline is already stably drained")
+    void emptyPipelineDrainsImmediately() throws Exception {
+        pipeline = new ProcessingPipeline(configuration("1", "1"), envelope -> {});
+        pipeline.start();
+        pipeline.stopAcceptingSubmissions();
+
+        assertTrue(pipeline.awaitDrained(ShutdownDeadline.start(Duration.ofSeconds(1))));
+        assertThrows(InterruptedException.class, () -> pipeline.submit(envelope("too-late")));
+        assertEquals(0, pipeline.queueDepth());
+        assertEquals(0, pipeline.inFlightCount());
+        assertEquals(0, pipeline.outstandingWorkCount());
+    }
+
+    @Test
+    @DisplayName("queue emptiness does not finish drain while an event is in flight")
+    void inFlightWorkKeepsDrainOpen() throws Exception {
+        CountDownLatch enteredBoundary = new CountDownLatch(1);
+        CountDownLatch releaseBoundary = new CountDownLatch(1);
+        pipeline =
+                new ProcessingPipeline(
+                        configuration("1", "1"),
+                        envelope -> {
+                            enteredBoundary.countDown();
+                            try {
+                                releaseBoundary.await();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        });
+        pipeline.start();
+        pipeline.submit(envelope("in-flight"));
+        assertTrue(enteredBoundary.await(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+        assertEquals(0, pipeline.queueDepth());
+        assertEquals(1, pipeline.inFlightCount());
+        pipeline.stopAcceptingSubmissions();
+
+        Future<Boolean> drain =
+                producers.submit(
+                        () -> pipeline.awaitDrained(ShutdownDeadline.start(Duration.ofSeconds(5))));
+        assertThrows(
+                TimeoutException.class,
+                () -> drain.get(BLOCKED_PROBE_MILLIS, TimeUnit.MILLISECONDS),
+                "an empty queue with one in-flight event is not drained");
+
+        releaseBoundary.countDown();
+        assertTrue(drain.get(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+    }
+
+    @Test
+    @DisplayName("queued accepted work drains before workers stop")
+    void queuedWorkDrainsWithinDeadline() throws Exception {
+        CountDownLatch firstEntered = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        AtomicInteger applied = new AtomicInteger();
+        pipeline =
+                new ProcessingPipeline(
+                        configuration("2", "1"),
+                        envelope -> {
+                            if (applied.getAndIncrement() == 0) {
+                                firstEntered.countDown();
+                                try {
+                                    releaseFirst.await();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+                        });
+        pipeline.start();
+        pipeline.submit(envelope("first"));
+        assertTrue(firstEntered.await(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+        pipeline.submit(envelope("queued"));
+        pipeline.stopAcceptingSubmissions();
+
+        Future<Boolean> drain =
+                producers.submit(
+                        () -> pipeline.awaitDrained(ShutdownDeadline.start(Duration.ofSeconds(5))));
+        releaseFirst.countDown();
+
+        assertTrue(drain.get(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+        assertEquals(2, applied.get());
+        pipeline.requestWorkerStop();
+        assertTrue(
+                pipeline.awaitWorkerTermination(ShutdownDeadline.start(Duration.ofSeconds(1))));
+    }
+
+    @Test
+    @DisplayName("deadline expiry permits queued non-durable work to be discarded")
+    void deadlineExpiryAllowsForcedWorkerTermination() throws Exception {
+        CountDownLatch enteredBoundary = new CountDownLatch(1);
+        CountDownLatch releaseBoundary = new CountDownLatch(1);
+        pipeline =
+                new ProcessingPipeline(
+                        configuration("2", "1"),
+                        envelope -> {
+                            enteredBoundary.countDown();
+                            try {
+                                releaseBoundary.await();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        });
+        pipeline.start();
+        pipeline.submit(envelope("in-flight"));
+        assertTrue(enteredBoundary.await(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+        pipeline.submit(envelope("discarded"));
+        pipeline.stopAcceptingSubmissions();
+
+        assertFalse(pipeline.awaitDrained(ShutdownDeadline.start(Duration.ofMillis(50))));
+        assertEquals(1, pipeline.forceWorkerStop());
+        releaseBoundary.countDown();
+        assertTrue(
+                pipeline.awaitWorkerTermination(ShutdownDeadline.start(Duration.ofSeconds(1))));
     }
 
     @Test

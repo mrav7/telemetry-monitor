@@ -11,8 +11,8 @@ producer/consumer pipeline with explicitly limited resources.
 > configuration, the protocol layer, the ingestion pipeline — a concurrent TCP
 > listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing, message
 > validation, a bounded queue and a fixed set of processing workers — and
-> source monitoring, which tracks every source as `ONLINE` or `STALE`, are
-> implemented and tested. Graceful shutdown is not implemented yet.
+> source monitoring, which tracks every source as `ONLINE` or `STALE`, and
+> coordinated graceful shutdown are implemented and tested.
 
 ## Requirements
 
@@ -121,9 +121,6 @@ its default, but a variable that is set to an unusable value stops startup with
 a diagnostic naming the variable and a non-zero exit status. Values are never
 clamped, trimmed or silently replaced by the default.
 
-`TM_SHUTDOWN_GRACE_SECONDS` describes a component that is not implemented yet;
-it is validated now so that configuration stays a single, stable contract.
-
 ## Protocol
 
 Version 1 of the wire protocol is UTF-8 newline-delimited JSON:
@@ -222,7 +219,9 @@ state is in one place, whatever order the workers happen to run in.
 disconnect, a connection error, an oversized message or a refused connection
 affects only the connection it belongs to; the listener and the workers keep
 running. A message from a source that cannot be admitted is refused on its own
-and costs neither the worker nor the connection.
+and costs neither the worker nor the connection. An unexpected exception while
+applying one event is logged and isolated to that event; the worker remains
+available for later work.
 
 ## Source state
 
@@ -278,6 +277,36 @@ it nor any other source.
 **Not durable.** Source state lives in memory for the lifetime of the process.
 It is not persisted, and restarting the monitor starts from no known sources.
 
+## Graceful shutdown
+
+`SIGTERM` and normal JVM shutdown invoke the same coordinated, idempotent
+shutdown operation. The first request changes the service from running to
+stopping and starts the single monotonic deadline configured by
+`TM_SHUTDOWN_GRACE_SECONDS`; repeated or concurrent requests join that same
+operation and do not restart its budget.
+
+Shutdown proceeds in this order:
+
+1. The listener and active client sockets are closed, connection tasks are
+   interrupted, and all connection producers are awaited while processing
+   workers remain active. A producer blocked by queue backpressure exits on
+   interruption and does not retry its enqueue.
+2. Once no producer can enqueue again, the stale-source scheduler stops.
+3. Workers drain accepted work until both the queue is empty and no event is
+   still being processed.
+4. Workers stop and all owned sockets and executors are released.
+
+Every phase receives only the time still remaining from the original global
+deadline. If it expires, shutdown interrupts the remaining work, may discard
+queued events, logs the affected phase and continues terminating. Pending work
+and source state are in-memory and non-durable: graceful shutdown is a bounded
+best effort, not an at-least-once or exactly-once delivery guarantee.
+
+Operational shutdown progress is logged with events such as
+`shutdown_requested`, `shutdown_producers_stopped`,
+`shutdown_drain_completed`, and `shutdown_completed`. A deadline expiry or
+forced stop is logged at `WARN` with queue and in-flight context where useful.
+
 ## Current limitations
 
 - Source state is in memory only, and is not exposed anywhere but the logs:
@@ -285,9 +314,8 @@ It is not persisted, and restarting the monitor starts from no known sources.
   counted, not stored — no history is kept.
 - Sources are never removed, so a process that is sent many distinct source
   identifiers holds the ones it admitted until it stops.
-- Shutdown is not graceful yet. The process stops when it is terminated; there
-  is no deadline, no queue drain and no guarantee about messages already
-  accepted. `TM_SHUTDOWN_GRACE_SECONDS` is validated but not yet applied.
+- Graceful shutdown is bounded and non-durable. Work still queued or in flight
+  when the global deadline expires may be discarded.
 - There is no simulator, no container image and no acknowledgement to clients.
 
 ## Technology

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationLoader;
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import io.github.mrav7.telemetrymonitor.protocol.ConnectionContext;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEnvelope;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEvent;
@@ -223,6 +224,27 @@ class StaleMonitorTest {
                 Thread.getAllStackTraces().keySet().stream()
                         .noneMatch(thread -> thread.getName().startsWith("tm-stale-monitor")));
         assertEquals(SourceStatus.ONLINE, registry.snapshot("source-01").orElseThrow().status());
+    }
+
+    @Test
+    @DisplayName("coordinated stop terminates the scheduler within the shared deadline")
+    void coordinatedStopTerminatesScheduler() throws Exception {
+        MovableClock clock = new MovableClock(T0);
+        SourceRegistry registry = new SourceRegistry(10);
+        registry.apply(envelope("source-01", T0));
+        monitor = new StaleMonitor(STALE_AFTER, CHECK_INTERVAL, clock, registry);
+        monitor.start();
+
+        monitor.requestStop();
+        assertTrue(monitor.awaitTermination(ShutdownDeadline.start(Duration.ofSeconds(5))));
+
+        clock.set(T0.plus(STALE_AFTER));
+        await().pollDelay(CHECK_INTERVAL.multipliedBy(2))
+                .atMost(BOUNDED_WAIT)
+                .until(
+                        () ->
+                                registry.snapshot("source-01").orElseThrow().status()
+                                        == SourceStatus.ONLINE);
     }
 
     private static boolean schedulerThreadExists() {

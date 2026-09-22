@@ -1,6 +1,7 @@
 package io.github.mrav7.telemetrymonitor.state;
 
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Objects;
@@ -21,8 +22,8 @@ import org.slf4j.LoggerFactory;
  * <p>Time comes from the injected {@link Clock}, which is what lets a test drive the threshold
  * without waiting out a real interval.
  *
- * <p>Ownership: this class creates its executor and shuts it down in {@link #close()}. That is
- * resource termination only — the service-wide shutdown sequence is separate work.
+ * <p>Ownership: this class creates its executor and exposes stop/await operations to the service
+ * shutdown coordinator. {@link #close()} remains a bounded component-local fallback.
  */
 public final class StaleMonitor implements AutoCloseable {
 
@@ -82,9 +83,21 @@ public final class StaleMonitor implements AutoCloseable {
     }
 
     /** Stops the schedule and releases the executor. Safe to call more than once. */
+    public void requestStop() {
+        scheduler.shutdown();
+    }
+
+    public boolean awaitTermination(ShutdownDeadline deadline) throws InterruptedException {
+        return deadline.awaitTermination(scheduler);
+    }
+
+    public void forceStop() {
+        scheduler.shutdownNow();
+    }
+
     @Override
     public void close() {
-        scheduler.shutdownNow();
+        forceStop();
         try {
             if (!scheduler.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 log.warn(

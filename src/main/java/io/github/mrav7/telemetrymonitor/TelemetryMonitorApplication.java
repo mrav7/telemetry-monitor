@@ -3,6 +3,7 @@ package io.github.mrav7.telemetrymonitor;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationException;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationLoader;
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownCoordinator;
 import io.github.mrav7.telemetrymonitor.network.TelemetryServer;
 import io.github.mrav7.telemetrymonitor.processing.ProcessingPipeline;
 import io.github.mrav7.telemetrymonitor.state.SourceRegistry;
@@ -20,9 +21,9 @@ import org.slf4j.LoggerFactory;
  * scheduled staleness monitor, and then serves connections until the listener is closed. Accepted
  * telemetry is applied to the source registry by the processing workers.
  *
- * <p>The runtime owns the pieces it wires together and releases them in reverse order. That is
- * resource termination, not a shutdown policy: the service-wide deadline, the producer stop and the
- * final queue drain are later work.
+ * <p>A single coordinator owns the process lifecycle and the global shutdown deadline. The JVM
+ * hook and the serving thread both use that same coordinator, so SIGTERM and ordinary cleanup join
+ * one idempotent shutdown operation.
  */
 public final class TelemetryMonitorApplication {
 
@@ -70,23 +71,42 @@ public final class TelemetryMonitorApplication {
         Clock clock = Clock.systemUTC();
         SourceRegistry registry = new SourceRegistry(configuration.maxSources());
         ProcessingPipeline pipeline = new ProcessingPipeline(configuration, registry::apply);
-        try (StaleMonitor staleMonitor = new StaleMonitor(configuration, clock, registry);
-                TelemetryServer server = new TelemetryServer(configuration, clock, pipeline)) {
-            try {
-                server.bind();
-            } catch (IOException e) {
-                log.error(
-                        "event=server_start_failed bind_address={} port={} reason={}",
-                        configuration.bindAddress().getHostAddress(),
-                        configuration.port(),
-                        e.toString());
-                return EXIT_LISTENER_UNAVAILABLE;
-            }
+        StaleMonitor staleMonitor = new StaleMonitor(configuration, clock, registry);
+        TelemetryServer server = new TelemetryServer(configuration, clock, pipeline);
+        try {
+            server.bind();
+        } catch (IOException e) {
+            log.error(
+                    "event=server_start_failed bind_address={} port={} reason={}",
+                    configuration.bindAddress().getHostAddress(),
+                    configuration.port(),
+                    e.toString());
+            server.close();
+            staleMonitor.close();
+            pipeline.close();
+            return EXIT_LISTENER_UNAVAILABLE;
+        }
+
+        ShutdownCoordinator shutdown =
+                new ShutdownCoordinator(configuration.shutdownGrace(), server, pipeline, staleMonitor);
+        Thread shutdownHook = new Thread(shutdown::shutdown, "tm-shutdown-hook");
+        Runtime runtime = Runtime.getRuntime();
+        boolean hookInstalled = false;
+        try {
             pipeline.start();
             staleMonitor.start();
+            runtime.addShutdownHook(shutdownHook);
+            hookInstalled = true;
             server.serve();
         } finally {
-            pipeline.close();
+            shutdown.shutdown();
+            if (hookInstalled) {
+                try {
+                    runtime.removeShutdownHook(shutdownHook);
+                } catch (IllegalStateException ignored) {
+                    // The JVM is already shutting down and owns hook removal.
+                }
+            }
         }
         return EXIT_SUCCESS;
     }

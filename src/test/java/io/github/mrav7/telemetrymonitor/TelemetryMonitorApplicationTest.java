@@ -185,6 +185,10 @@ class TelemetryMonitorApplicationTest {
                 }
             }
 
+            long pid() {
+                return process.pid();
+            }
+
             /** Waits until the monitor answers on its port, which is its readiness signal. */
             void awaitListening(int port) throws Exception {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(BOUNDED_WAIT_SECONDS);
@@ -218,14 +222,23 @@ class TelemetryMonitorApplicationTest {
                         "the monitor never logged '" + marker + "'; stdout was: " + stdout());
             }
 
-            @Override
-            public void close() throws Exception {
-                process.destroy();
+            void terminate() throws Exception {
+                Process signal =
+                        new ProcessBuilder("kill", "-TERM", Long.toString(process.pid())).start();
+                assertTrue(signal.waitFor(5, TimeUnit.SECONDS), "kill -TERM should return");
+                assertEquals(0, signal.exitValue(), "kill -TERM should signal the monitor");
                 assertTrue(
                         process.waitFor(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS),
-                        "the monitor process should end when terminated");
+                        "the monitor process should end after SIGTERM");
                 outPump.join(TimeUnit.SECONDS.toMillis(5));
                 errPump.join(TimeUnit.SECONDS.toMillis(5));
+            }
+
+            @Override
+            public void close() throws Exception {
+                if (process.isAlive()) {
+                    terminate();
+                }
             }
         }
 
@@ -316,6 +329,42 @@ class TelemetryMonitorApplicationTest {
                 assertTrue(
                         atWarn.stdout().isBlank(),
                         "WARN should suppress the INFO records, but stdout was: " + atWarn.stdout());
+            }
+        }
+
+        @Test
+        @DisplayName("SIGTERM uses coordinated shutdown, closes clients and releases the port")
+        void sigtermRunsCoordinatedShutdown() throws Exception {
+            int port = reservePort();
+            try (RunningMonitor monitor =
+                            new RunningMonitor(
+                                    Map.of(
+                                            "TM_BIND_ADDRESS", "127.0.0.1",
+                                            "TM_PORT", String.valueOf(port),
+                                            "TM_SHUTDOWN_GRACE_SECONDS", "3"));
+                    Socket client = new Socket()) {
+                monitor.awaitListening(port);
+                client.connect(new InetSocketAddress("127.0.0.1", port), 5_000);
+                client.getOutputStream()
+                        .write(
+                                ("{\"version\":1,\"sourceId\":\"sigterm-source\","
+                                                + "\"occurredAt\":\"2026-09-21T18:15:42Z\","
+                                                + "\"metric\":\"temperature\",\"value\":18.72}\n")
+                                        .getBytes(UTF_8));
+                client.getOutputStream().flush();
+                monitor.awaitStdout("source_id=sigterm-source");
+
+                long pid = monitor.pid();
+                monitor.terminate();
+
+                client.setSoTimeout((int) TimeUnit.SECONDS.toMillis(5));
+                assertEquals(-1, client.getInputStream().read(), "active client socket must close");
+                assertTrue(pid > 0);
+                assertTrue(monitor.stdout().contains("event=shutdown_requested"), monitor.stdout());
+                assertTrue(monitor.stdout().contains("event=shutdown_completed"), monitor.stdout());
+                try (ServerSocket rebound = new ServerSocket()) {
+                    rebound.bind(new InetSocketAddress("127.0.0.1", port));
+                }
             }
         }
 

@@ -1,6 +1,7 @@
 package io.github.mrav7.telemetrymonitor.processing;
 
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEnvelope;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -9,6 +10,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,16 +28,17 @@ import org.slf4j.LoggerFactory;
  * source registry. This class deliberately holds no state of its own beyond the queue, so what an
  * event does to source state is decided in one place and not here.
  *
- * <p>The pipeline owns its queue and its worker executor, and closes both in {@link #close()}.
+ * <p>The pipeline owns its queue and its worker executor. During coordinated shutdown it also
+ * tracks accepted work through the processing boundary, so an empty queue is not mistaken for a
+ * completed drain while a worker is still applying an event.
  */
 public final class ProcessingPipeline implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(ProcessingPipeline.class);
 
     /**
-     * Bound on waiting for workers to notice {@link #close()}. This is only enough to keep tests
-     * and local runs from leaking threads; the service-wide shutdown deadline is separate work and
-     * is not implemented here.
+     * Fallback bound used only by {@link #close()}. Coordinated service shutdown passes the shared
+     * remaining deadline to the explicit drain and termination methods instead.
      */
     private static final long TERMINATION_TIMEOUT_SECONDS = 5;
 
@@ -43,6 +47,10 @@ public final class ProcessingPipeline implements AutoCloseable {
     private final Consumer<TelemetryEnvelope> boundary;
     private final int queueCapacity;
     private final int workerCount;
+    private final AtomicBoolean acceptingSubmissions = new AtomicBoolean(true);
+    private final AtomicInteger outstanding = new AtomicInteger();
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final Object drainMonitor = new Object();
 
     /**
      * @param configuration supplies the frozen queue capacity and worker count
@@ -74,7 +82,23 @@ public final class ProcessingPipeline implements AutoCloseable {
      *     must stop producing rather than retry, so that a stopping service cannot keep enqueueing
      */
     public void submit(TelemetryEnvelope envelope) throws InterruptedException {
-        queue.put(Objects.requireNonNull(envelope, "envelope"));
+        Objects.requireNonNull(envelope, "envelope");
+        if (!acceptingSubmissions.get()) {
+            throw new InterruptedException("processing pipeline is stopping");
+        }
+
+        // Count before put so a fast worker cannot finish the envelope before it is represented in
+        // the drain state. An interrupted put rolls the reservation back and is never retried.
+        outstanding.incrementAndGet();
+        boolean submitted = false;
+        try {
+            queue.put(envelope);
+            submitted = true;
+        } finally {
+            if (!submitted) {
+                workCompleted();
+            }
+        }
     }
 
     public int queueCapacity() {
@@ -95,7 +119,82 @@ public final class ProcessingPipeline implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 return;
             }
-            apply(envelope);
+            inFlight.incrementAndGet();
+            try {
+                apply(envelope);
+            } finally {
+                inFlight.decrementAndGet();
+                workCompleted();
+            }
+        }
+    }
+
+    /** Seals the queue after the coordinator has established the producer termination barrier. */
+    public void stopAcceptingSubmissions() {
+        acceptingSubmissions.set(false);
+    }
+
+    /**
+     * Waits until no accepted envelope is queued or executing, using only the global deadline.
+     */
+    public boolean awaitDrained(ShutdownDeadline deadline) throws InterruptedException {
+        Objects.requireNonNull(deadline, "deadline");
+        synchronized (drainMonitor) {
+            while (!drained()) {
+                long remaining = deadline.remainingNanos();
+                if (remaining == 0L) {
+                    return false;
+                }
+                TimeUnit.NANOSECONDS.timedWait(drainMonitor, remaining);
+            }
+            return true;
+        }
+    }
+
+    public int queueDepth() {
+        return queue.size();
+    }
+
+    public int inFlightCount() {
+        return inFlight.get();
+    }
+
+    /** Accepted work that is queued, in flight, or currently blocked while entering the queue. */
+    public int outstandingWorkCount() {
+        return outstanding.get();
+    }
+
+    /** Requests clean worker termination after final drain. */
+    public void requestWorkerStop() {
+        workers.shutdownNow();
+    }
+
+    public boolean awaitWorkerTermination(ShutdownDeadline deadline) throws InterruptedException {
+        return deadline.awaitTermination(workers);
+    }
+
+    /** Interrupts workers and discards queued, non-durable work. */
+    public int forceWorkerStop() {
+        acceptingSubmissions.set(false);
+        int discarded = queue.size();
+        queue.clear();
+        workers.shutdownNow();
+        return discarded;
+    }
+
+    private boolean drained() {
+        return outstanding.get() == 0 && queue.isEmpty() && inFlight.get() == 0;
+    }
+
+    private void workCompleted() {
+        int remaining = outstanding.decrementAndGet();
+        if (remaining < 0) {
+            throw new IllegalStateException("processing work count became negative");
+        }
+        if (remaining == 0) {
+            synchronized (drainMonitor) {
+                drainMonitor.notifyAll();
+            }
         }
     }
 
@@ -117,6 +216,7 @@ public final class ProcessingPipeline implements AutoCloseable {
     /** Stops the workers and releases the executor. Safe to call more than once. */
     @Override
     public void close() {
+        stopAcceptingSubmissions();
         workers.shutdownNow();
         try {
             if (!workers.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {

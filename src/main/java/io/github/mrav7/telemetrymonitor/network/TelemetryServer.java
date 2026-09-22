@@ -1,6 +1,7 @@
 package io.github.mrav7.telemetrymonitor.network;
 
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import io.github.mrav7.telemetrymonitor.processing.ProcessingPipeline;
 import io.github.mrav7.telemetrymonitor.protocol.BoundedFrameReader;
 import io.github.mrav7.telemetrymonitor.protocol.ConnectionContext;
@@ -26,6 +27,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,9 +55,8 @@ public final class TelemetryServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TelemetryServer.class);
 
     /**
-     * Bound on waiting for connection tasks after {@link #close()}. Enough to keep runs and tests
-     * from leaking threads; the service-wide shutdown deadline is separate work, not implemented
-     * here.
+     * Fallback bound used only by {@link #close()}. Coordinated service shutdown instead passes the
+     * remaining global deadline to {@link #awaitProducerTermination(ShutdownDeadline)}.
      */
     private static final long TERMINATION_TIMEOUT_SECONDS = 5;
 
@@ -63,6 +64,7 @@ public final class TelemetryServer implements AutoCloseable {
     private final int listenPort;
     private final Clock clock;
     private final ProcessingPipeline pipeline;
+    private final Runnable beforeAdmission;
     private final TelemetryMessageDecoder decoder = new TelemetryMessageDecoder();
 
     private final Semaphore connectionPermits;
@@ -72,8 +74,10 @@ public final class TelemetryServer implements AutoCloseable {
      * server opened without relying on interrupt delivery to reach each connection task.
      */
     private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
+    private final Set<Connection> activeConnections = ConcurrentHashMap.newKeySet();
     private final ExecutorService connections = Executors.newVirtualThreadPerTaskExecutor();
     private final AtomicLong connectionIds = new AtomicLong();
+    private final Object admissionLock = new Object();
 
     private volatile ServerSocket listener;
     private volatile boolean stopping;
@@ -81,7 +85,7 @@ public final class TelemetryServer implements AutoCloseable {
     /** Builds a server that listens on the configured endpoint. */
     public TelemetryServer(
             MonitorConfiguration configuration, Clock clock, ProcessingPipeline pipeline) {
-        this(configuration, configuration.port(), clock, pipeline);
+        this(configuration, configuration.port(), clock, pipeline, () -> {});
     }
 
     /**
@@ -93,10 +97,20 @@ public final class TelemetryServer implements AutoCloseable {
             int listenPort,
             Clock clock,
             ProcessingPipeline pipeline) {
+        this(configuration, listenPort, clock, pipeline, () -> {});
+    }
+
+    TelemetryServer(
+            MonitorConfiguration configuration,
+            int listenPort,
+            Clock clock,
+            ProcessingPipeline pipeline,
+            Runnable beforeAdmission) {
         this.configuration = Objects.requireNonNull(configuration, "configuration");
         this.listenPort = listenPort;
         this.clock = Objects.requireNonNull(clock, "clock");
         this.pipeline = Objects.requireNonNull(pipeline, "pipeline");
+        this.beforeAdmission = Objects.requireNonNull(beforeAdmission, "beforeAdmission");
         this.connectionPermits = new Semaphore(configuration.maxConnections());
     }
 
@@ -147,46 +161,50 @@ public final class TelemetryServer implements AutoCloseable {
                 log.warn("event=accept_failed reason={}", e.toString());
                 continue;
             }
+            beforeAdmission.run();
             admit(socket);
         }
         log.debug("event=accept_loop_ended");
     }
 
     private void admit(Socket socket) {
-        if (!connectionPermits.tryAcquire()) {
-            log.warn(
-                    "event=connection_rejected reason=max_connections remote={} limit={}",
-                    remoteOf(socket),
-                    configuration.maxConnections());
-            closeQuietly(socket);
-            return;
-        }
-
-        long connectionId = connectionIds.incrementAndGet();
-        boolean handed = false;
-        try {
-            activeSockets.add(socket);
-            connections.execute(new Connection(socket, connectionId));
-            handed = true;
-        } catch (RejectedExecutionException e) {
-            // The executor is shutting down, so nothing will run this connection.
-            log.debug("event=connection_dropped connection_id={} reason=stopping", connectionId);
-        } finally {
-            if (!handed) {
-                release(socket);
+        synchronized (admissionLock) {
+            // accept() may have returned immediately before shutdown acquired this lock. Recheck
+            // the lifecycle boundary before taking a permit or creating a producer task.
+            if (stopping) {
                 closeQuietly(socket);
+                return;
+            }
+            if (!connectionPermits.tryAcquire()) {
+                log.warn(
+                        "event=connection_rejected reason=max_connections remote={} limit={}",
+                        remoteOf(socket),
+                        configuration.maxConnections());
+                closeQuietly(socket);
+                return;
+            }
+
+            long connectionId = connectionIds.incrementAndGet();
+            Connection connection = new Connection(socket, connectionId);
+            boolean handed = false;
+            try {
+                activeSockets.add(socket);
+                activeConnections.add(connection);
+                connections.execute(connection);
+                handed = true;
+            } catch (RejectedExecutionException e) {
+                log.debug("event=connection_dropped connection_id={} reason=stopping", connectionId);
+            } finally {
+                if (!handed) {
+                    connection.releaseOnce();
+                    closeQuietly(socket);
+                }
             }
         }
     }
 
-    /** Returns the permit and forgets the socket. Called exactly once per admitted connection. */
-    private void release(Socket socket) {
-        activeSockets.remove(socket);
-        connectionPermits.release();
-    }
-
     /**
-     * Stops accepting, ends active connections and releases every resource this server created.
+     * Requests producer shutdown by stopping admission, closing sockets and interrupting tasks.
      *
      * <p>Each blocked operation is released by the mechanism that actually reaches it. The accept
      * loop runs on the caller's thread, which is a platform thread, so the listening socket is
@@ -198,22 +216,44 @@ public final class TelemetryServer implements AutoCloseable {
      * class visibly closes what it opened. Safe to call repeatedly, and safe to call when the
      * server never bound.
      *
-     * <p>This is resource termination, not the service's shutdown policy: there is no deadline, no
-     * queue drain and no guarantee about events already accepted.
+     * <p>This is the component-local fallback. The application uses {@link #requestProducerStop()}
+     * and {@link #awaitProducerTermination(ShutdownDeadline)} through its shutdown coordinator.
      */
-    @Override
-    public void close() {
-        stopping = true;
-
-        ServerSocket current = listener;
-        if (current != null) {
-            closeQuietly(current);
+    public void requestProducerStop() {
+        synchronized (admissionLock) {
+            stopping = true;
+            ServerSocket current = listener;
+            if (current != null) {
+                closeQuietly(current);
+            }
+            connections.shutdownNow();
         }
         for (Socket socket : activeSockets) {
             closeQuietly(socket);
         }
+    }
 
-        connections.shutdownNow();
+    /** Waits for every connection producer using only the shared remaining deadline. */
+    public boolean awaitProducerTermination(ShutdownDeadline deadline) throws InterruptedException {
+        boolean terminated = deadline.awaitTermination(connections);
+        if (terminated) {
+            // shutdownNow may return a task that never commenced, so its run/finally block never
+            // executes. Executor termination proves no task can now start; release any such
+            // connection here. releaseOnce also makes this safe for tasks that did run.
+            for (Connection connection : activeConnections) {
+                connection.releaseOnce();
+            }
+        }
+        return terminated;
+    }
+
+    int availableConnectionPermits() {
+        return connectionPermits.availablePermits();
+    }
+
+    @Override
+    public void close() {
+        requestProducerStop();
         try {
             if (!connections.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 log.warn(
@@ -255,6 +295,7 @@ public final class TelemetryServer implements AutoCloseable {
 
         private final Socket socket;
         private final ConnectionContext context;
+        private final AtomicBoolean released = new AtomicBoolean();
 
         private Connection(Socket socket, long connectionId) {
             this.socket = socket;
@@ -278,8 +319,16 @@ public final class TelemetryServer implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 log.debug("event=connection_interrupted {}", context);
             } finally {
-                release(socket);
+                releaseOnce();
                 log.debug("event=connection_closed {}", context);
+            }
+        }
+
+        private void releaseOnce() {
+            if (released.compareAndSet(false, true)) {
+                activeConnections.remove(this);
+                activeSockets.remove(socket);
+                connectionPermits.release();
             }
         }
 

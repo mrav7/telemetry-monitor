@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationException;
 import io.github.mrav7.telemetrymonitor.configuration.ConfigurationLoader;
 import io.github.mrav7.telemetrymonitor.configuration.MonitorConfiguration;
+import io.github.mrav7.telemetrymonitor.lifecycle.ShutdownDeadline;
 import io.github.mrav7.telemetrymonitor.processing.ProcessingPipeline;
 import io.github.mrav7.telemetrymonitor.protocol.TelemetryEnvelope;
 import java.io.IOException;
@@ -19,6 +20,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -694,9 +696,65 @@ class TelemetryServerTest {
         send(client, frameFor("source-01", "fills-queue", 2.0));
         send(client, frameFor("source-01", "blocks-producer", 3.0));
 
-        server.close();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(BOUNDED_WAIT_SECONDS);
+        while (pipeline.outstandingWorkCount() != 3 && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertEquals(
+                3,
+                pipeline.outstandingWorkCount(),
+                "the producer must have reserved work and be blocked in queue.put");
+
+        server.requestProducerStop();
+        assertTrue(
+                server.awaitProducerTermination(
+                        ShutdownDeadline.start(Duration.ofSeconds(BOUNDED_WAIT_SECONDS))));
         acceptLoop.get(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS);
+        assertEquals(1, pipeline.queueDepth(), "the interrupted put must not retry or enqueue");
+        assertEquals(
+                configuration.maxConnections(),
+                server.availableConnectionPermits(),
+                "the interrupted connection must return its permit");
         holdWorker.countDown();
+    }
+
+    @Test
+    @DisplayName("an accepted socket crossing the shutdown boundary never becomes a producer")
+    void acceptRaceClosesSocketWithoutStartingProducerOrLeakingPermit() throws Exception {
+        MonitorConfiguration configuration = load(Map.of(ConfigurationLoader.MAX_CONNECTIONS, "1"));
+        pipeline = new ProcessingPipeline(configuration, processed::add);
+        pipeline.start();
+        CountDownLatch acceptedBeforeAdmission = new CountDownLatch(1);
+        CountDownLatch continueAdmission = new CountDownLatch(1);
+        server =
+                new TelemetryServer(
+                        configuration,
+                        0,
+                        FIXED_CLOCK,
+                        pipeline,
+                        () -> {
+                            acceptedBeforeAdmission.countDown();
+                            try {
+                                continueAdmission.await();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                        });
+        server.bind();
+        acceptLoop = serverThreads.submit(server::serve);
+
+        Socket crossing = connect(server.boundPort());
+        assertTrue(acceptedBeforeAdmission.await(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS));
+        server.requestProducerStop();
+        continueAdmission.countDown();
+
+        acceptLoop.get(BOUNDED_WAIT_SECONDS, TimeUnit.SECONDS);
+        assertTrue(
+                server.awaitProducerTermination(
+                        ShutdownDeadline.start(Duration.ofSeconds(BOUNDED_WAIT_SECONDS))));
+        awaitEndOfStream(crossing);
+        assertEquals(1, server.availableConnectionPermits());
+        assertEquals(0, pipeline.outstandingWorkCount());
     }
 
     @Test
