@@ -8,10 +8,12 @@ multiple TCP clients, validates it, and processes it through a bounded
 producer/consumer pipeline with explicitly limited resources.
 
 > **Project status:** early development. The build baseline, the operational
-> configuration and the protocol layer — byte-level framing, strict UTF-8
-> decoding, NDJSON parsing and message validation — are implemented and tested.
-> The TCP listener, the processing pipeline and source monitoring are not
-> implemented yet, so the service does not accept connections.
+> configuration, the protocol layer and the ingestion pipeline — a concurrent
+> TCP listener, byte-level framing, strict UTF-8 decoding, NDJSON parsing,
+> message validation, a bounded queue and a fixed set of processing workers —
+> are implemented and tested. Accepted messages currently reach a minimal
+> processing boundary that logs them at `DEBUG` level and nothing more. Source
+> monitoring (`ONLINE`/`STALE`) and graceful shutdown are not implemented yet.
 
 ## Requirements
 
@@ -25,6 +27,59 @@ CI builds resolve the same Maven version.
 
 ```bash
 ./mvnw package
+```
+
+## Run
+
+Build once, then write out the runtime classpath and start the service:
+
+```bash
+./mvnw package
+./mvnw -q dependency:build-classpath \
+  -Dmdep.outputFile=target/classpath.txt -DincludeScope=runtime
+java -cp "target/classes:$(cat target/classpath.txt)" \
+  io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
+```
+
+The service reads its settings from the environment, binds the configured
+address and port, and then serves until the process is terminated:
+
+```bash
+TM_BIND_ADDRESS=127.0.0.1 TM_PORT=9100 TM_LOG_LEVEL=DEBUG \
+  java -cp "target/classes:$(cat target/classpath.txt)" \
+  io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
+```
+
+Startup stops with a non-zero exit status, and says why, when a variable is
+unusable or when the listener cannot be opened — for example when the port is
+already taken.
+
+Once it is listening, any TCP client can send telemetry. One message per line:
+
+```bash
+printf '{"version":1,"sourceId":"source-01","occurredAt":"2026-09-21T18:15:42.123Z","metric":"temperature","value":18.72}\n' \
+  | ncat --send-only 127.0.0.1 9100
+```
+
+Several messages can be sent over the same connection, and one connection may
+carry several sources. An invalid message is rejected on its own and the
+connection stays usable; an oversized message ends the connection that sent it,
+because the byte stream can no longer be realigned to a message boundary.
+
+With `TM_LOG_LEVEL=DEBUG` the monitor reports each connection and each processed
+message:
+
+```text
+event=server_listening bind_address=127.0.0.1 port=9100 max_connections=256
+event=connection_accepted connection_id=1 remote=/127.0.0.1:37786
+event=event_processed source_id=source-01 metric=temperature ...
+event=message_rejected connection_id=1 remote=/127.0.0.1:37786 reason=invalid_json
+```
+
+To check that the listener is open:
+
+```bash
+ss -ltn 'sport = :9100'
 ```
 
 ## Test
@@ -62,8 +117,10 @@ its default, but a variable that is set to an unusable value stops startup with
 a diagnostic naming the variable and a non-zero exit status. Values are never
 clamped, trimmed or silently replaced by the default.
 
-Several of these settings describe components that are not implemented yet; they
-are validated now so that configuration stays a single, stable contract.
+`TM_MAX_SOURCES`, `TM_STALE_AFTER_SECONDS`, `TM_STALE_CHECK_INTERVAL_SECONDS`
+and `TM_SHUTDOWN_GRACE_SECONDS` describe components that are not implemented
+yet; they are validated now so that configuration stays a single, stable
+contract.
 
 ## Protocol
 
@@ -124,6 +181,49 @@ carrying it cannot be continued.
 
 Bytes left at the end of a stream without a closing newline are discarded
 without being decoded.
+
+## Ingestion
+
+```text
+TCP connection
+      ↓  one virtual thread per connection
+framing → UTF-8 → JSON → validation
+      ↓
+bounded queue (TM_QUEUE_CAPACITY)
+      ↓
+fixed processing workers (TM_WORKER_THREADS)
+```
+
+**Connections.** Every accepted connection is handled on its own virtual thread,
+so a client that sends slowly, or stops halfway through a message, does not
+delay anyone else. At most `TM_MAX_CONNECTIONS` connections are active at a
+time; a connection arriving when that limit is reached is closed immediately,
+with a log record, and connections already running are unaffected. A connection
+is not a source identity: nothing is remembered about a client between
+connections.
+
+**Queue and workers.** Validated messages are handed to a bounded queue of
+`TM_QUEUE_CAPACITY` messages, drained by exactly `TM_WORKER_THREADS` workers.
+The worker count does not grow with load.
+
+**Backpressure.** When the queue is full, the connection being read waits for
+capacity instead of discarding the message. That connection stops consuming its
+socket, and TCP then slows the sender down. Valid messages are not dropped.
+
+**Failure isolation.** An invalid message affects only that message. A
+disconnect, a connection error, an oversized message or a refused connection
+affects only the connection it belongs to; the listener and the workers keep
+running.
+
+## Current limitations
+
+- Source state is not implemented: nothing tracks which sources are `ONLINE` or
+  `STALE`. Accepted messages reach a minimal processing boundary that logs them
+  at `DEBUG` level; they are not stored, counted or aggregated anywhere.
+- Shutdown is not graceful yet. The process stops when it is terminated; there
+  is no deadline, no queue drain and no guarantee about messages already
+  accepted. `TM_SHUTDOWN_GRACE_SECONDS` is validated but not yet applied.
+- There is no simulator, no container image and no acknowledgement to clients.
 
 ## Technology
 
