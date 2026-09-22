@@ -14,8 +14,9 @@ producer/consumer pipeline with explicitly limited resources.
 > source monitoring, which tracks every source as `ONLINE` or `STALE`, and
 > coordinated graceful shutdown are implemented and tested. A TCP telemetry
 > simulator core now provides normal, burst, malformed, silent and disconnect
-> traffic modes; integrated simulator-to-monitor verification and final run
-> documentation are still pending.
+> traffic modes. Automated simulator-to-monitor tests cover ONLINE, STALE,
+> recovery, multiple clients, bounded backpressure, malformed input isolation
+> and disconnect isolation. Final simulator run documentation is still pending.
 
 ## Requirements
 
@@ -319,9 +320,8 @@ forced stop is logged at `WARN` with queue and in-flight context where useful.
   identifiers holds the ones it admitted until it stops.
 - Graceful shutdown is bounded and non-durable. Work still queued or in flight
   when the global deadline expires may be discarded.
-- Simulator-to-monitor verification and final simulator run documentation are
-  not yet complete. There is no container image and no acknowledgement to
-  clients.
+- Final simulator run documentation is not yet complete. There is no container
+  image and no acknowledgement to clients.
 
 ## Technology
 
