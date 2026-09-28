@@ -1,110 +1,165 @@
 # Telemetry Monitor
 
-Telemetry Monitor is a personal technical Java project for generic TCP
-telemetry ingestion, concurrent processing, source-state monitoring and
-graceful shutdown.
+[![CI](https://github.com/mrav7/telemetry-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/mrav7/telemetry-monitor/actions/workflows/ci.yml)
 
-It is a long-running Core Java service that accepts newline-delimited JSON
-telemetry from many TCP clients, validates each message, and processes it
-through a bounded producer/consumer pipeline. Every resource that external
-input can grow — connections, message size, queued events, known sources — has
-an explicit limit. A companion simulator generates normal, burst, malformed,
-silent and disconnecting traffic, and the monitor runs from the terminal on
-Linux or as a Docker container.
+A Core Java service for concurrent TCP telemetry ingestion, bounded event processing, source-state monitoring, and coordinated graceful shutdown.
 
-## Requirements
+Built as a technical portfolio project, it explores long-running service design under explicit resource limits: virtual-thread connection handling, bounded queues and backpressure, concurrent state updates, failure isolation, and deterministic shutdown behavior.
 
-- **Java 25** (the build targets release 25)
-- No Maven installation — the repository ships the Maven Wrapper
-- Docker, only to build and run the container image
+## What this project demonstrates
 
-Maven itself is downloaded and pinned by the wrapper on first use, so local and
-CI builds resolve the same Maven version.
+- **Concurrent network I/O:** each active TCP connection is isolated on its own virtual thread.
+- **Bounded processing:** validated events enter a bounded producer/consumer pipeline drained by a fixed worker pool.
+- **Backpressure:** full queues slow producers instead of allowing unbounded memory growth.
+- **Failure isolation:** malformed input, disconnects, oversized frames, and processing failures are contained to the smallest safe scope.
+- **Concurrent source-state management:** source liveness is tracked independently from connection state and remains correct under concurrent processing.
+- **Graceful shutdown:** producers, schedulers, queued work, and workers are coordinated under one global shutdown deadline.
+- **End-to-end verification:** real TCP tests, traffic simulation, container smoke tests, and GitHub Actions verify behavior beyond unit tests.
 
-## Build
+## Architecture
+
+```text
+Telemetry Simulator (or any TCP client)
+                │
+                │ TCP / NDJSON
+                ▼
+        TelemetryServer
+   one virtual thread / connection
+                │
+                ▼
+ framing → UTF-8 → JSON → validation
+                │
+                ▼
+         bounded queue
+                │
+                ▼
+       fixed worker pool
+                │
+                ▼
+        SourceRegistry
+                ▲
+                │
+          StaleMonitor
+
+ShutdownCoordinator → one global shutdown deadline
+```
+
+The main runtime responsibilities are deliberately separated:
+
+- `TelemetryServer` owns the listening socket, active client sockets, and per-connection virtual threads.
+- `ProcessingPipeline` owns the bounded queue and fixed processing workers.
+- `SourceRegistry` is the single place where source state is updated.
+- `StaleMonitor` periodically moves silent sources from `ONLINE` to `STALE`.
+- `ShutdownCoordinator` stops the service in a fixed order under one shared deadline.
+
+## Design overview
+
+### Explicit resource bounds
+
+Every resource that external input can grow has an explicit limit:
+
+`connections · message size · queued events · tracked sources`
+
+These limits are part of the runtime model rather than informal operational assumptions.
+
+### Backpressure
+
+Validated events are inserted into a bounded queue. When that queue is full, the producing connection waits for capacity instead of allowing memory usage to grow without bound.
+
+This is flow control, not durability: accepted events remain in memory and may still be lost if the process stops abruptly or the shutdown deadline expires.
+
+### Failure isolation
+
+Malformed messages, connection failures, refused connections, and processing failures are isolated whenever protocol framing still allows the service to continue safely.
+
+Oversized messages are handled differently: the connection is closed because the byte stream can no longer be reliably realigned to a message boundary.
+
+## Source monitoring
+
+Sources are tracked independently of TCP connections:
+
+| State | Meaning |
+|---|---|
+| `ONLINE` | A known source with recently accepted telemetry |
+| `STALE` | No accepted telemetry within the configured staleness threshold |
+
+Freshness is based on the monitor's own reception time rather than the timestamp declared by the remote source.
+
+An open TCP connection does not keep a source `ONLINE`, and a source may send telemetry through different connections over time.
+
+Source state is held in memory and is not persisted across process restarts.
+
+## Graceful shutdown
+
+`SIGTERM` and normal JVM shutdown trigger the same coordinated, idempotent shutdown path.
+
+The service:
+
+1. stops accepting new work and interrupts connection producers;
+2. stops the staleness scheduler once producers can no longer enqueue;
+3. drains accepted work while time remains;
+4. stops workers and releases owned resources.
+
+All phases share one monotonic deadline configured by `TM_SHUTDOWN_GRACE_SECONDS`; the timeout is not reset between shutdown stages.
+
+## Tech stack
+
+**Java 25 · Maven · Jackson · SLF4J / Logback · JUnit · Awaitility · Docker · GitHub Actions**
+
+## Quick start
+
+### Requirements
+
+- Java 25
+- Git
+- no global Maven installation required; the repository includes the Maven Wrapper
+
+Build the project:
 
 ```bash
 ./mvnw package
 ```
 
-This produces `target/telemetry-monitor-0.1.0-SNAPSHOT.jar` and copies its
-runtime dependencies to `target/lib/`. No separate Maven classpath-generation
-step is needed to run either application.
-
-## Run the monitor
-
-Start the service from the packaged build:
+Start the monitor:
 
 ```bash
 java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
   io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
 ```
 
-The service reads its settings from the environment, binds the configured
-address and port, and then serves until the process is terminated:
+The default listener address is `127.0.0.1:9100`.
 
-```bash
-TM_BIND_ADDRESS=127.0.0.1 TM_PORT=9100 TM_LOG_LEVEL=DEBUG \
-  java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.TelemetryMonitorApplication
-```
-
-Startup stops with a non-zero exit status, and says why, when a variable is
-unusable or when the listener cannot be opened — for example when the port is
-already taken.
-
-Once it is listening, any TCP client can send telemetry. One message per line:
+Send one telemetry message with any TCP client, for example:
 
 ```bash
 printf '{"version":1,"sourceId":"source-01","occurredAt":"2026-09-21T18:15:42.123Z","metric":"temperature","value":18.72}\n' \
   | ncat --send-only 127.0.0.1 9100
 ```
 
-Several messages can be sent over the same connection, and one connection may
-carry several sources. An invalid message is rejected on its own and the
-connection stays usable; an oversized message ends the connection that sent it,
-because the byte stream can no longer be realigned to a message boundary.
+Source-state changes and operational events are written to standard output.
 
-Source state changes are reported at `INFO`; with `TM_LOG_LEVEL=DEBUG` each
-connection is reported as well:
+## Traffic simulator
 
-```text
-event=server_listening bind_address=127.0.0.1 port=9100 max_connections=256
-event=connection_accepted connection_id=1 remote=/127.0.0.1:37786
-event=source_first_seen source_id=source-01 first_accepted_at=... known_sources=1
-event=source_stale source_id=source-01 last_accepted_at=... silent_seconds=30
-event=source_online source_id=source-01 last_accepted_at=...
-event=message_rejected connection_id=1 remote=/127.0.0.1:37786 reason=invalid_json
-```
+The packaged build also includes a companion simulator for repeatable TCP scenarios:
 
-Individual accepted messages are not logged: under load that would produce one
-record per message and drown everything else.
+| Mode | Scenario |
+|---|---|
+| `normal` | Periodic valid telemetry |
+| `burst` | Valid events without deliberate pacing |
+| `malformed` | Deliberately invalid input |
+| `silent` | A connected source that stops sending |
+| `disconnect` | Valid traffic followed by a normal close |
 
-To check that the listener is open:
-
-```bash
-ss -ltn 'sport = :9100'
-```
-
-## Run the simulator
-
-The simulator is the second application in the packaged build. It connects to
-the monitor over TCP and requires `--source-id` and `--mode`:
+Example:
 
 ```bash
 java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
   io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id source-01 --mode disconnect
+  --source-id source-01 \
+  --mode disconnect
 ```
 
-Common defaults are `--host 127.0.0.1`, `--port 9100`, `--metric temperature`,
-and `--value 20.0`. `normal` defaults to one event per second for 30 seconds;
-`burst` defaults to 1000 events; `silent` defaults to 40 seconds; and
-`disconnect` defaults to three events. A simulator exits with `0` when its
-configured client-side scenario completes successfully, `1` for invalid CLI
-configuration, and `2` when it cannot execute the scenario. Success does not
-mean the monitor acknowledged, accepted, or processed an event: protocol v1
-has no acknowledgement or persistence.
+The simulator reports whether its own client-side scenario completed successfully. Protocol v1 does not provide acknowledgements or persistence.
 
 ### Simulator modes
 
@@ -178,8 +233,8 @@ ShutdownCoordinator ── one global deadline for the whole stop sequence
   the virtual-thread executor. Connection tasks only read, frame, decode,
   validate and enqueue.
 - **`ProcessingPipeline`** owns the bounded queue and the fixed worker pool.
-- **`SourceRegistry`** is the only place source state changes; workers hand
-  validated, queued events to it for source admission and atomic per-source updateds.
+- **`SourceRegistry`** is the only place source state changes; workers apply
+  accepted events to it with atomic per-source updates.
 - **`StaleMonitor`** runs the periodic staleness check on a scheduled executor.
 - **`ShutdownCoordinator`** stops these components in a fixed order under one
   deadline, from either `SIGTERM` or normal JVM shutdown.
@@ -199,266 +254,35 @@ disconnect isolation.
 ./mvnw test
 ```
 
-To run the same lifecycle that the [CI](#ci) build-and-test job runs:
+Run the same Maven verification lifecycle used by CI:
 
 ```bash
 ./mvnw verify
 ```
 
-## Configuration
+Automated tests include real TCP end-to-end scenarios covering:
 
-All settings come from environment variables. There is no configuration file.
+- `ONLINE → STALE → ONLINE` source-state behavior;
+- multiple simulators and connections;
+- bounded backpressure;
+- malformed-input isolation;
+- disconnect isolation;
+- shutdown behavior.
 
-| Variable | Default | Meaning and accepted values |
-|---|---|---|
-| `TM_BIND_ADDRESS` | `127.0.0.1` | Address the listener will bind to. A literal IPv4 or IPv6 address; host names are not resolved. Use `0.0.0.0` to accept connections from outside a container. |
-| `TM_PORT` | `9100` | TCP port. `1`–`65535`. |
-| `TM_MAX_CONNECTIONS` | `256` | Maximum simultaneously active connections. Positive. |
-| `TM_WORKER_THREADS` | `4` | Fixed number of processing workers. Positive. |
-| `TM_QUEUE_CAPACITY` | `1024` | Capacity of the bounded processing queue. Positive. |
-| `TM_MAX_MESSAGE_BYTES` | `8192` | Maximum bytes in one message, excluding the newline. Positive. |
-| `TM_MAX_SOURCES` | `10000` | Maximum distinct sources tracked. Positive. |
-| `TM_STALE_AFTER_SECONDS` | `30` | Silence after which a source is considered stale. Positive. |
-| `TM_STALE_CHECK_INTERVAL_SECONDS` | `5` | How often staleness is evaluated. Positive. |
-| `TM_SHUTDOWN_GRACE_SECONDS` | `10` | Global deadline for the whole shutdown sequence. Positive. |
-| `TM_LOG_LEVEL` | `INFO` | One of `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, case-insensitive. |
+GitHub Actions runs two independent checks:
 
-Configuration is validated at startup. A variable that is not set falls back to
-its default, but a variable that is set to an unusable value stops startup with
-a diagnostic naming the variable and a non-zero exit status. Values are never
-clamped, trimmed or silently replaced by the default.
-
-## Protocol
-
-Version 1 of the wire protocol is UTF-8 newline-delimited JSON:
-
-- one compact JSON object per message;
-- messages are separated by a line feed (`LF`);
-- a carriage return immediately before the line feed (`CRLF`) is accepted and
-  removed;
-- only `version` `1` is accepted, and there is no version negotiation.
-
-### Message format
-
-```json
-{"version":1,"sourceId":"source-01","occurredAt":"2026-09-21T18:15:42.123Z","metric":"temperature","value":18.72}
-```
-
-All five properties are required:
-
-| Property | Type | Rules |
-|---|---|---|
-| `version` | number | Must be the integer `1`. |
-| `sourceId` | string | Identifier of the sending source: 1–64 characters from `A–Z`, `a–z`, `0–9`, `_`, `.`, `-`. |
-| `occurredAt` | string | ISO-8601 instant, as declared by the source. Used as data, never to decide whether a source is alive. |
-| `metric` | string | Identifier of the reading, same character rules as `sourceId`. There is no predefined metric catalogue. |
-| `value` | number | A finite number. `NaN` and infinities are rejected. |
-
-Validation is strict: unknown properties, repeated properties, explicit nulls and
-values of the wrong JSON type are all rejected, and no value is coerced — `"1"`
-is not accepted for `version`.
-
-The monitor records its own reception timestamp for each accepted message. That
-timestamp, not `occurredAt`, is what source monitoring is based on, because the
-clock of a remote process is not a reliable liveness signal.
-
-### Message size
-
-The maximum message size defaults to 8192 bytes and is set by
-`TM_MAX_MESSAGE_BYTES`.
-
-- The limit counts **bytes**, not Java characters, so a message of multi-byte
-  characters reaches the limit sooner than its character count suggests.
-- The `LF` delimiter does not count toward the limit.
-- A `CR` in a `CRLF` ending does count, and is removed only after the size has
-  been checked.
-- The limit is enforced while the message is being read, so an oversized message
-  is detected without being buffered in full.
-
-### Invalid input
-
-Messages are rejected individually. An empty message, invalid UTF-8, malformed
-JSON, an unsupported version and any invalid property all cause that one message
-to be discarded; a connection carrying them stays usable.
-
-An oversized message is different: because reading stops partway through, the
-byte stream can no longer be realigned to a message boundary, so the connection
-carrying it cannot be continued.
-
-Bytes left at the end of a stream without a closing newline are discarded
-without being decoded.
-
-## Ingestion
-
-```text
-TCP connection
-      ↓  one virtual thread per connection
-framing → UTF-8 → JSON → validation
-      ↓
-bounded queue (TM_QUEUE_CAPACITY)
-      ↓
-fixed processing workers (TM_WORKER_THREADS)
-      ↓
-source state (TM_MAX_SOURCES)  ←  scheduled staleness check
-```
-
-**Connections.** Every accepted connection is handled on its own virtual thread,
-so a client that sends slowly, or stops halfway through a message, does not
-delay anyone else. At most `TM_MAX_CONNECTIONS` connections are active at a
-time; a connection arriving when that limit is reached is closed immediately,
-with a log record, and connections already running are unaffected. A connection
-is not a source identity: nothing is remembered about a client between
-connections.
-
-**Queue and workers.** Validated messages are handed to a bounded queue of
-`TM_QUEUE_CAPACITY` messages, drained by exactly `TM_WORKER_THREADS` workers.
-The worker count does not grow with load.
-
-**Backpressure.** When the queue is full, the connection being read waits for
-capacity instead of discarding the message. That connection stops consuming its
-socket, and TCP then slows the sender down. A full queue therefore never causes
-a validated message to be discarded at the enqueue step. This is flow control,
-not durability: accepted events live only in memory and can still be lost if
-the process ends abruptly or a shutdown deadline expires (see
-[Known limitations and security baseline](#known-limitations-and-security-baseline)).
-
-**Source state.** Workers are what apply an accepted message to the state of its
-source; connections never touch it. That keeps the decision of what a source's
-state is in one place, whatever order the workers happen to run in.
-
-**Failure isolation.** An invalid message affects only that message. A
-disconnect, a connection error, an oversized message or a refused connection
-affects only the connection it belongs to; the listener and the workers keep
-running. A message from a source that cannot be admitted is refused on its own
-and costs neither the worker nor the connection. An unexpected exception while
-applying one event is logged and isolated to that event; the worker remains
-available for later work.
-
-## Source state
-
-The monitor keeps the current operational state of every source it has accepted
-a message from, in memory, keyed by `sourceId`. A source is in one of two
-states:
-
-| State | Meaning |
-|---|---|
-| `ONLINE` | A known source that has not been marked `STALE`. Accepted telemetry creates this state and restores it. |
-| `STALE` | A scheduled check found that nothing had been accepted from this source for at least `TM_STALE_AFTER_SECONDS`. |
-
-There is no third state. A source the monitor has never accepted a message from
-is simply not tracked.
-
-**How state moves.** The first accepted message admits the source as `ONLINE`.
-Every further accepted message keeps it `ONLINE` and, if it was `STALE`, brings
-it back. In the other direction, a check runs every
-`TM_STALE_CHECK_INTERVAL_SECONDS` and marks as `STALE` every source whose last
-accepted message is at least `TM_STALE_AFTER_SECONDS` old. Only accepted
-telemetry makes a source `ONLINE`, and only that scheduled check makes one
-`STALE`.
-
-The state is stored, not recalculated on demand. Between the moment a source
-falls silent past the threshold and the next scheduled check, it is still
-recorded as `ONLINE`, so the check interval is also the granularity with which
-a source is observed to go `STALE`.
-
-**Which clock decides.** Freshness is measured with the monitor's own reception
-time, never with the `occurredAt` the message declares. A source whose clock is
-wrong, or which backdates its messages, is judged on when its telemetry actually
-arrived. Messages that are processed out of order cannot make a source look
-older than it is: the newest reception time always wins.
-
-**Per source, the monitor tracks:** its identifier and state, when it was first
-accepted, when it was last accepted, how many of its events were accepted, and
-how many were processed.
-
-**Connection state is not source state.** A connection that is open but silent
-does not keep its source `ONLINE`, and a source going `STALE` never closes a
-connection — both situations are normal and can be observed at the same time.
-One connection may carry several sources, and a source may arrive over several
-connections; nothing binds one to the other. Disconnecting does not remove a
-source or change its counters.
-
-**Bound.** At most `TM_MAX_SOURCES` distinct sources are tracked. Once that
-limit is reached, messages from sources already known keep being accepted as
-usual, while a message from an unknown source is refused with a log record and
-changes nothing. Nothing is evicted to make room — not even a `STALE` source,
-which keeps its slot — and the refusal affects neither the connection that sent
-it nor any other source.
-
-**Not durable.** Source state lives in memory for the lifetime of the process.
-It is not persisted, and restarting the monitor starts from no known sources.
-
-## Graceful shutdown
-
-`SIGTERM` and normal JVM shutdown invoke the same coordinated, idempotent
-shutdown operation. The first request changes the service from running to
-stopping and starts the single monotonic deadline configured by
-`TM_SHUTDOWN_GRACE_SECONDS`; repeated or concurrent requests join that same
-operation and do not restart its budget.
-
-Shutdown proceeds in this order:
-
-1. The listener and active client sockets are closed, connection tasks are
-   interrupted, and all connection producers are awaited while processing
-   workers remain active. A producer blocked by queue backpressure exits on
-   interruption and does not retry its enqueue.
-2. Once no producer can enqueue again, the stale-source scheduler stops.
-3. Workers drain accepted work until both the queue is empty and no event is
-   still being processed.
-4. Workers stop and all owned sockets and executors are released.
-
-Every phase receives only the time still remaining from the original global
-deadline. If it expires, shutdown interrupts the remaining work, may discard
-queued events, logs the affected phase and continues terminating. Pending work
-and source state are in-memory and non-durable: graceful shutdown is a bounded
-best effort, not an at-least-once or exactly-once delivery guarantee.
-
-Operational shutdown progress is logged with events such as
-`shutdown_requested`, `shutdown_producers_stopped`,
-`shutdown_drain_completed`, and `shutdown_completed`. A deadline expiry or
-forced stop is logged at `WARN` with queue and in-flight context where useful.
-
-## Failure behavior
-
-| Situation | What happens | Where to look |
-|---|---|---|
-| Invalid configuration | Startup stops before anything is opened; exit status `1`. | `Invalid configuration: ...` on standard error, naming the variable |
-| Port already in use, or bind fails | Startup stops; exit status `2`. | `event=server_start_failed` with the address, port and reason |
-| Malformed JSON, missing, unknown or repeated property, wrong type, unsupported version, invalid field value | That message is discarded; the connection stays open. | `event=message_rejected reason=...` (for example `invalid_json`, `unsupported_version`, `invalid_source_id`) |
-| Empty line | Discarded; the connection stays open. | `event=message_rejected reason=empty_frame` |
-| Invalid UTF-8 | That message is discarded; the connection stays open. | `event=message_rejected reason=invalid_utf8` |
-| Message larger than `TM_MAX_MESSAGE_BYTES` | Not processed; that connection is closed. | `event=oversized_message reason=message_too_large` |
-| `TM_MAX_CONNECTIONS` reached | The new connection is closed immediately; existing ones continue. | `event=connection_rejected reason=max_connections` |
-| `TM_MAX_SOURCES` reached | Messages from unknown sources are refused; known sources continue. | `event=source_rejected reason=max_sources` |
-| Client disconnects or its connection fails | Only that connection ends. An unterminated trailing message is discarded. | `event=connection_io_failure` at `WARN`; normal closes at `DEBUG` |
-| Unexpected exception while applying an event | Logged and isolated to that event; the worker continues. | `event=processing_failure` at `ERROR` |
-| Queue full | The sending connection waits (backpressure); nothing is discarded at that point. | Slower upstream sending; no per-message log |
-| Source falls silent | Marked `STALE` by the next check; its connection is left open. | `event=source_stale` |
-| Stale source sends again | Returns to `ONLINE`. | `event=source_online` |
-| Shutdown deadline expires | Remaining work may be discarded; shutdown still completes. | `event=shutdown_deadline_expired` or `event=shutdown_forced` at `WARN` |
-
-Rejected messages are logged with a reason, never with their payload. The
-monitor does not retry, reconnect or answer clients; the simulator does not
-reconnect either.
+- **Build and test:** compiles the project and runs the full Maven verification lifecycle.
+- **Container smoke:** builds the Docker image and executes the container smoke test.
 
 ## Docker
 
-The repository's `Dockerfile` builds the monitor from source in two stages. The
-first stage compiles, tests and packages the project with the Maven Wrapper on
-a Java 25 JDK. The final image is an Eclipse Temurin Java 25 JRE image (Ubuntu
-based) with only the application JAR and its runtime dependencies added. It
-contains no build tools, sources or tests, and runs the monitor as an
-unprivileged user.
-
-Build the image from the repository root:
+Build the container image:
 
 ```bash
 docker build -t telemetry-monitor:local .
 ```
 
-The build runs the full test suite and fails if any test fails.
-
-Run the monitor with its port published on the host's loopback interface:
+Run the service with the container port published only on the host loopback interface:
 
 ```bash
 docker run --rm \
@@ -468,212 +292,21 @@ docker run --rm \
   telemetry-monitor:local
 ```
 
-`TM_BIND_ADDRESS=0.0.0.0` is required here. The service's default,
-`127.0.0.1`, is the container's own loopback interface, and traffic arriving
-through a published port never reaches it. The image does not change that
-default: listening more widely is an explicit choice made when the container is
-started. It is what makes the published port work, not a security boundary:
-access is limited by where the port is published. `-p 127.0.0.1:9100:9100`
-publishes it on the host's loopback interface only. Do not publish the port on
-an interface reachable from untrusted networks (see
-[Known limitations and security baseline](#known-limitations-and-security-baseline)). The image declares `EXPOSE 9100` to document the
-default port, but that does not publish anything by itself.
+The image uses a multi-stage build, contains the runtime application rather than build tooling, and runs the monitor as an unprivileged user.
 
-The container is configured with the same `TM_*` environment variables as a
-host run (see [Configuration](#configuration)); there are no Docker-specific
-settings. If `TM_PORT` is changed, publish that container port instead.
+A container smoke test verifies startup, configuration propagation, TCP ingestion, signal handling, graceful shutdown, host-port release, and invalid-configuration behavior.
 
-```bash
-docker run --rm \
-  --name telemetry-monitor \
-  -e TM_BIND_ADDRESS=0.0.0.0 \
-  -e TM_MAX_CONNECTIONS=64 \
-  -e TM_LOG_LEVEL=DEBUG \
-  -p 127.0.0.1:9100:9100 \
-  telemetry-monitor:local
-```
+## Limitations
 
-Logs go to standard output and no log file is written inside the container.
-Read them with:
+Telemetry Monitor is intended for development, testing, and controlled environments. It is not hardened for exposure to untrusted networks.
 
-```bash
-docker logs telemetry-monitor
-```
+The current implementation intentionally does not provide:
 
-The image defines no `HEALTHCHECK`, and the service has no HTTP endpoint.
-Readiness shows up in the logs as `event=server_listening`.
+- TLS, authentication, or authorization;
+- persistent telemetry or persistent source state;
+- delivery acknowledgements, retries, or at-least-once / exactly-once guarantees;
+- deduplication or global event ordering;
+- an HTTP API or source-state export;
+- published throughput or latency guarantees.
 
-### Simulator against the container
-
-The packaged simulator on the host reaches the container through the published
-port:
-
-```bash
-./mvnw package
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --host 127.0.0.1 --port 9100 \
-  --source-id docker-source --mode disconnect --count 3
-```
-
-`docker logs telemetry-monitor` then shows
-`event=source_first_seen source_id=docker-source`. As in a host run, the
-simulator's exit status only reports whether its own scenario completed; the
-monitor does not acknowledge telemetry.
-
-### Stopping the container
-
-```bash
-docker stop --timeout 15 telemetry-monitor
-```
-
-`docker stop` sends `SIGTERM`. The image starts Java directly, with no shell in
-between, so the JVM is the container's main process. The signal reaches it and
-runs the same [graceful shutdown](#graceful-shutdown) as on a host, logged as
-`shutdown_requested` … `shutdown_completed`. After that the container exits
-with status 143, meaning it was ended by `SIGTERM`.
-
-`docker stop` waits 10 seconds by default before sending `SIGKILL`, which is
-the same as the default `TM_SHUTDOWN_GRACE_SECONDS`. A stop timeout longer than
-the configured grace, as above, lets a shutdown that uses its whole budget
-finish first. A container that is killed (exit status 137) skips whatever
-shutdown steps remain.
-
-### Container smoke test
-
-`scripts/container-smoke.sh` checks a built image end to end. It needs the
-host package, for the simulator, and Java 25 on the host (`JAVA_HOME` or
-`PATH`):
-
-```bash
-./mvnw package
-docker build -t telemetry-monitor:local .
-scripts/container-smoke.sh telemetry-monitor:local
-```
-
-The script starts a container with explicit `TM_*` settings on a free
-loopback host port and waits for `server_listening`, with a time limit. It then
-checks that:
-
-- the configured values reached the application;
-- Java is the container's PID 1;
-- the simulator can send telemetry that the monitor admits;
-- `docker stop` completes the graceful shutdown without a `SIGKILL`;
-- the host port is released;
-- an invalid `TM_PORT` stops startup with a diagnostic.
-
-It stops and removes only the container it created.
-
-## CI
-
-GitHub Actions runs the `CI` workflow on every push and pull request, on an
-Ubuntu runner with Temurin Java 25 and the Maven Wrapper. It has two
-independent jobs, and both must pass:
-
-| Job | What it runs |
-|---|---|
-| Build and test | `./mvnw verify`: compiles and runs the full test suite. |
-| Container smoke | Packages the host simulator without running the tests again, builds the Docker image, and runs `scripts/container-smoke.sh` against it. |
-
-The Docker build runs the full Maven package and test lifecycle inside its
-builder stage, so the image is only produced from a tested build. The
-workflow needs no secrets and only read access to the repository, and it
-does not publish any image.
-
-The same checks can be run locally from the repository root:
-
-```bash
-# Build and test
-./mvnw --batch-mode --no-transfer-progress verify
-
-# Container smoke
-./mvnw --batch-mode --no-transfer-progress -DskipTests package
-docker build -t telemetry-monitor:local .
-scripts/container-smoke.sh telemetry-monitor:local
-```
-
-## Known limitations and security baseline
-
-Telemetry Monitor is intended for development, testing and controlled
-environments. It is not hardened for exposure to the Internet or other
-untrusted networks.
-
-**Security.** There is no TLS, no authentication, no authorization, no client
-certificates, no per-identity rate limiting and no payload encryption. Any
-client that can reach the port can send telemetry for any `sourceId`. The
-resource limits protect the process from unbounded growth; they are not access
-control.
-
-**State and delivery.**
-
-- All state is in memory and lasts only as long as the process. Restarting the
-  monitor loses known sources, counters, statuses and any telemetry not yet
-  processed.
-- There is no database and no telemetry history: individual values are counted,
-  not stored.
-- Source state is visible only in the logs. There is no API, endpoint or export.
-- There are no delivery guarantees: no acknowledgement, no at-least-once or
-  exactly-once processing, no persistent retry. An accepted event can be lost if
-  the process ends abruptly, and graceful shutdown can discard queued or
-  in-flight work when its deadline expires.
-- Sources are never evicted. Once `TM_MAX_SOURCES` distinct sources are known,
-  new ones are refused until the process restarts.
-
-**Ordering and duplicates.** TCP keeps bytes in order within one connection,
-but there is no global processing order across connections, sources or
-workers. Two events from the same source can finish processing in a different
-order from how they arrived; source state is designed to stay correct when
-that happens. There is no deduplication: two identical valid messages are two
-events.
-
-**Capacity.** The configured limits are resource controls, not throughput or
-latency promises. No performance figures are published.
-
-## Troubleshooting
-
-```bash
-# Is the monitor running, and with which PID?
-ps -ef | grep '[T]elemetryMonitorApplication'
-
-# Is it listening?
-ss -ltn 'sport = :9100'
-
-# Which process holds the port?
-lsof -nP -iTCP:9100 -sTCP:LISTEN
-
-# Follow logs that were redirected to a file
-tail -f monitor.log
-
-# JVM command line and a thread dump
-jcmd <pid> VM.command_line
-jstack <pid>
-
-# Container state and logs
-docker ps
-docker logs <container>
-```
-
-- **Startup fails:** read the `Invalid configuration: ...` line, or the
-  `event=server_start_failed` record, which names the address and port.
-- **Address already in use:** find the owner with `ss -ltnp` or `lsof`, then
-  stop it or choose another `TM_PORT`.
-- **The simulator cannot connect:** check that `--host` and `--port` match
-  `TM_BIND_ADDRESS` and `TM_PORT`; the monitor listens on `127.0.0.1` by
-  default.
-- **A container does not receive host traffic:** check that the container was
-  started with `TM_BIND_ADDRESS=0.0.0.0` and that `docker port <container>`
-  shows the published port.
-- **Shutdown takes long or reports expiry:** follow the `shutdown_*` events;
-  `WARN` records name the phase that ran out of time.
-
-## Technology
-
-| Concern | Choice |
-|---|---|
-| Language / runtime | Java 25 |
-| Build | Maven 3.9.16 via Maven Wrapper |
-| JSON | Jackson |
-| Logging | SLF4J with Logback, to stdout |
-| Testing | JUnit 6.1.3, Awaitility |
-| Container | Docker, Eclipse Temurin 25 base images |
-| CI | GitHub Actions |
+Configured resource limits bound process growth; they are not access controls or performance claims.
