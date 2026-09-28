@@ -161,94 +161,55 @@ java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
 
 The simulator reports whether its own client-side scenario completed successfully. Protocol v1 does not provide acknowledgements or persistence.
 
-### Simulator modes
+## Protocol
 
-| Mode | Purpose | Relevant controls |
-|---|---|---|
-| `normal` | Periodic valid telemetry | `--rate`, `--duration-seconds` |
-| `burst` | Valid events without deliberate pacing | `--count` |
-| `malformed` | One deliberately invalid frame | `--case` |
-| `silent` | One valid event, then an open silent TCP connection | `--duration-seconds` |
-| `disconnect` | Valid events, then a normal close | `--count` |
+Telemetry uses UTF-8 newline-delimited JSON over TCP.
 
-Malformed cases are `broken-json`, `missing-field`, `unsupported-version`,
-`invalid-source-id`, `invalid-timestamp`, and `invalid-value`.
-
-### Simulator examples
-
-Run these after `./mvnw package` while a monitor is listening on
-`127.0.0.1:9100`:
-
-```bash
-# Periodic valid telemetry.
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id normal-01 --mode normal --rate 5 --duration-seconds 2
-
-# A valid burst without deliberate pacing.
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id burst-01 --mode burst --count 100
-
-# One deliberately invalid frame.
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id malformed-01 --mode malformed --case invalid-value
-
-# Establish a source, then keep its connection open without telemetry.
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id silent-01 --mode silent --duration-seconds 40
-
-# Send valid telemetry and close normally.
-java -cp 'target/telemetry-monitor-0.1.0-SNAPSHOT.jar:target/lib/*' \
-  io.github.mrav7.telemetrymonitor.simulator.TelemetrySimulatorApplication \
-  --source-id disconnect-01 --mode disconnect --count 3
+```json
+{
+  "version": 1,
+  "sourceId": "source-01",
+  "occurredAt": "2026-09-21T18:15:42.123Z",
+  "metric": "temperature",
+  "value": 18.72
+}
 ```
 
-## Architecture overview
+Protocol v1 uses strict validation:
 
-```text
-Telemetry Simulator (or any TCP client)
-        │  TCP, one NDJSON message per line
-        ▼
-TelemetryServer ── accept loop, connection limit
-        │  one virtual thread per connection
-        ▼
-byte framing → strict UTF-8 → JSON decoding → validation
-        │  blocking put
-        ▼
-bounded queue (ArrayBlockingQueue)
-        │
-        ▼
-fixed processing workers
-        │
-        ▼
-SourceRegistry ◄── StaleMonitor (scheduled ONLINE → STALE check)
+- all five fields are required;
+- unknown or repeated properties are rejected;
+- explicit `null` values and incorrect JSON types are rejected;
+- `version` must be the integer `1`;
+- `sourceId` and `metric` use a restricted identifier format;
+- `value` must be finite;
+- messages are bounded by `TM_MAX_MESSAGE_BYTES`.
 
-ShutdownCoordinator ── one global deadline for the whole stop sequence
-```
+The monitor records its own reception timestamp for source-state decisions. `occurredAt` is treated as source-provided data, not as a liveness signal.
 
-- **`TelemetryServer`** owns the listening socket, the connection sockets and
-  the virtual-thread executor. Connection tasks only read, frame, decode,
-  validate and enqueue.
-- **`ProcessingPipeline`** owns the bounded queue and the fixed worker pool.
-- **`SourceRegistry`** is the only place source state changes; workers apply
-  accepted events to it with atomic per-source updates.
-- **`StaleMonitor`** runs the periodic staleness check on a scheduled executor.
-- **`ShutdownCoordinator`** stops these components in a fixed order under one
-  deadline, from either `SIGTERM` or normal JVM shutdown.
+## Configuration
 
-Configuration is read once at startup from environment variables. Logs go to
-standard output; an invalid configuration is reported on standard error before
-logging starts.
+Configuration is read once at startup from environment variables.
 
-Automated end-to-end tests run the simulator against the monitor over real
-TCP and cover `ONLINE`, `STALE` while a connection remains open, recovery,
-multiple simulators, bounded backpressure, malformed-input isolation and
-disconnect isolation.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `TM_BIND_ADDRESS` | `127.0.0.1` | Listener address |
+| `TM_PORT` | `9100` | TCP listener port |
+| `TM_MAX_CONNECTIONS` | `256` | Maximum active connections |
+| `TM_WORKER_THREADS` | `4` | Fixed processing worker count |
+| `TM_QUEUE_CAPACITY` | `1024` | Bounded event queue capacity |
+| `TM_MAX_MESSAGE_BYTES` | `8192` | Maximum message size |
+| `TM_MAX_SOURCES` | `10000` | Maximum tracked sources |
+| `TM_STALE_AFTER_SECONDS` | `30` | Silence threshold before `STALE` |
+| `TM_STALE_CHECK_INTERVAL_SECONDS` | `5` | Source-state check interval |
+| `TM_SHUTDOWN_GRACE_SECONDS` | `10` | Global shutdown deadline |
+| `TM_LOG_LEVEL` | `INFO` | Runtime log level |
 
-## Test
+Invalid configured values stop startup with a diagnostic rather than being silently clamped or replaced.
+
+## Testing and CI
+
+Run the test suite:
 
 ```bash
 ./mvnw test
